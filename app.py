@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import html
+import importlib
 import sqlite3
+from datetime import datetime
 from urllib.parse import urlencode
 
 import pandas as pd
@@ -10,21 +12,46 @@ import streamlit as st
 import db
 import market_data
 import services
+import trade_db
+import trade_services
 from models import GeneratedLevel
 
 
-st.set_page_config(page_title="分档买入管理器", layout="wide")
+trade_db = importlib.reload(trade_db)
+trade_services = importlib.reload(trade_services)
+
+
+st.set_page_config(page_title="分档买入管理器", layout="wide", initial_sidebar_state="expanded")
+
+
+def now_minute_iso() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M")
 
 
 def apply_global_styles() -> None:
     st.markdown(
         """
         <style>
+        header[data-testid="stHeader"] {
+            background: transparent !important;
+            box-shadow: none !important;
+        }
+        div[data-testid="stDecoration"] {
+            display: none !important;
+        }
         .block-container {
             max-width: 100% !important;
             padding-left: 1.25rem !important;
             padding-right: 1.25rem !important;
-            padding-top: 3.5rem !important;
+            padding-top: 2.2rem !important;
+        }
+        section[data-testid="stSidebar"][aria-expanded="true"] {
+            width: 13rem !important;
+            min-width: 13rem !important;
+        }
+        section[data-testid="stSidebar"][aria-expanded="true"] > div {
+            width: 13rem !important;
+            min-width: 13rem !important;
         }
         </style>
         """,
@@ -139,6 +166,65 @@ def overview_global_action_url(action: str) -> str:
     return "?" + urlencode({"overview_action": action})
 
 
+def recommendation_source_action_url(action: str, source_id: int) -> str:
+    return "?" + urlencode(
+        {
+            "recommendation_source_action": action,
+            "source_id": int(source_id),
+        }
+    )
+
+
+def recommendation_plan_action_url(
+    action: str,
+    recommendation_id: int,
+    return_page: str | None = None,
+) -> str:
+    params = {
+        "recommendation_action": action,
+        "recommendation_id": int(recommendation_id),
+    }
+    if return_page:
+        params["return_page"] = return_page
+    return "?" + urlencode(params)
+
+
+def recommendation_source_refresh_url(source_id: int) -> str:
+    return "?" + urlencode(
+        {
+            "recommendation_source_action": "refresh_prices",
+            "source_id": int(source_id),
+        }
+    )
+
+
+def stock_operation_url(recommendation_id: int) -> str:
+    return "?" + urlencode(
+        {
+            "recommendation_action": "open_stock",
+            "recommendation_id": int(recommendation_id),
+        }
+    )
+
+
+def trade_order_action_url(action: str, order_id: int) -> str:
+    return "?" + urlencode(
+        {
+            "trade_order_action": action,
+            "trade_order_id": int(order_id),
+        }
+    )
+
+
+def trade_ladder_action_url(action: str, level_id: int) -> str:
+    return "?" + urlencode(
+        {
+            "trade_ladder_action": action,
+            "trade_ladder_level_id": int(level_id),
+        }
+    )
+
+
 def level_action_url(action: str, instrument_id: int, level_id: int) -> str:
     return "?" + urlencode(
         {
@@ -212,7 +298,7 @@ def signed_color(value: float | None) -> str:
 
 
 def render_colored_metric(column, label: str, value: str, color: str) -> None:
-    label_color = color if color != "inherit" else "rgba(250, 250, 250, 0.6)"
+    label_color = color if color != "inherit" else "#6b7280"
     column.markdown(
         (
             "<div style='display: flex; flex-direction: column; gap: 0.15rem;'>"
@@ -319,6 +405,891 @@ def colored_return_text(profit_value: float | None, return_pct: float | None) ->
     return f"<span class='{css_class}'>{html.escape(text)}</span>"
 
 
+def colored_money_text(value: float | None) -> str:
+    if value is None or pd.isna(value):
+        return "-"
+    css_class = "return-flat"
+    if float(value) > 0:
+        css_class = "return-positive"
+    elif float(value) < 0:
+        css_class = "return-negative"
+    return f"<span class='{css_class}'>{html.escape(money_signed(value))}</span>"
+
+
+def colored_percent_text(value: float | None, none_as_zero: bool = False) -> str:
+    if value is None or pd.isna(value):
+        if not none_as_zero:
+            return "-"
+        value = 0.0
+    css_class = "return-flat"
+    if float(value) > 0:
+        css_class = "return-positive"
+    elif float(value) < 0:
+        css_class = "return-negative"
+    return f"<span class='{css_class}'>{html.escape(percent_signed(value))}</span>"
+
+
+def invested_return_text(invested_amount: float | None, return_pct: float | None) -> str:
+    invested = 0.0 if invested_amount is None or pd.isna(invested_amount) else float(invested_amount)
+    return (
+        f"<span class='return-flat'>{html.escape(money(invested))}</span>/"
+        f"{colored_percent_text(return_pct, none_as_zero=True)}"
+    )
+
+
+TRADE_IDEA_COLUMNS = [
+    "id",
+    "来源",
+    "提出时间",
+    "标的",
+    "名称",
+    "计划价",
+    "当前价",
+    "持仓股数",
+    "卖出股数",
+    "投入金额",
+    "持仓成本",
+    "均价",
+    "买入价",
+    "卖出价",
+    "浮动盈亏",
+    "浮动盈亏率",
+    "已实现盈亏",
+    "已实现盈亏率",
+    "总收益",
+    "总收益率",
+    "状态",
+]
+
+
+def ensure_trade_idea_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty and not set(TRADE_IDEA_COLUMNS).issubset(frame.columns):
+        return pd.DataFrame(columns=TRADE_IDEA_COLUMNS)
+    for column in TRADE_IDEA_COLUMNS:
+        if column not in frame.columns:
+            frame[column] = pd.NA
+    return frame
+
+
+def optional_positive_float(value: float | int | None) -> float | None:
+    if value is None or pd.isna(value):
+        return None
+    numeric = float(value)
+    return numeric if numeric > 0 else None
+
+
+def recommendation_sources_mock() -> list[dict]:
+    return [dict(source) for source in trade_services.source_rows()]
+
+
+def get_recommendation_source(source_id: int) -> dict | None:
+    source = trade_services.get_source(source_id)
+    return dict(source) if source is not None else None
+
+
+RECOMMENDATION_MARKETS = ["美股", "A股", "港股", "加密"]
+
+
+def create_recommendation_source_mock(name: str, market: str) -> None:
+    trade_services.create_source(name, market)
+
+
+def update_recommendation_source_mock(source_id: int, name: str, market: str) -> None:
+    trade_services.update_source(source_id, name, market)
+
+
+def delete_recommendation_source_mock(source_id: int) -> None:
+    trade_services.delete_source(source_id)
+
+
+def recommendations_mock() -> list[dict]:
+    return [
+        {
+            "id": idea["id"],
+            "source_id": idea["source_id"],
+            "symbol": idea["symbol"],
+            "name": idea["name"] or "",
+            "recommended_at": idea["idea_at"],
+            "recommendation_price": idea["plan_price"],
+            "current_price": idea["current_price"],
+            "manual_status": idea["status"],
+        }
+        for idea in trade_db.list_ideas()
+    ]
+
+
+def get_recommendation_plan(recommendation_id: int) -> dict | None:
+    idea = trade_services.get_idea(recommendation_id)
+    if idea is None:
+        return None
+    return {
+        "id": idea["id"],
+        "source_id": idea["source_id"],
+        "symbol": idea["symbol"],
+        "name": idea["name"] or "",
+        "recommended_at": idea["idea_at"],
+        "recommendation_price": idea["plan_price"],
+        "current_price": idea["current_price"],
+        "manual_status": idea["status"],
+    }
+
+
+def create_recommendation_plan_mock(
+    source_id: int,
+    symbol: str,
+    name: str,
+    recommended_at: str,
+    recommendation_price: float,
+    current_price: float,
+) -> None:
+    trade_services.create_idea(
+        source_id=source_id,
+        symbol=symbol,
+        name=name,
+        idea_at=recommended_at,
+        plan_price=recommendation_price,
+        current_price=current_price,
+    )
+
+
+def update_recommendation_plan_mock(
+    recommendation_id: int,
+    symbol: str,
+    name: str,
+    recommended_at: str,
+    recommendation_price: float,
+    current_price: float,
+) -> None:
+    trade_services.update_idea(
+        idea_id=recommendation_id,
+        symbol=symbol,
+        name=name,
+        idea_at=recommended_at,
+        plan_price=recommendation_price,
+        current_price=current_price,
+    )
+
+
+def delete_recommendation_plan_mock(recommendation_id: int) -> None:
+    trade_services.delete_idea(recommendation_id)
+
+
+def complete_recommendation_plan_mock(recommendation_id: int) -> None:
+    trade_services.complete_idea(recommendation_id)
+
+
+def recommendation_trades_mock() -> list[dict]:
+    return trade_services.order_rows()
+
+
+def recommendation_rows() -> pd.DataFrame:
+    return trade_services.idea_rows()
+
+
+def recommendation_source_summary() -> pd.DataFrame:
+    return trade_services.source_summary()
+
+
+@st.dialog("新增来源")
+def create_recommendation_source_dialog() -> None:
+    with st.form("create_recommendation_source_form"):
+        name = st.text_input("来源名称")
+        market = st.selectbox("市场", RECOMMENDATION_MARKETS)
+        submitted = st.form_submit_button("保存", type="primary")
+    if submitted:
+        try:
+            create_recommendation_source_mock(name, market)
+            rerun()
+        except ValueError as exc:
+            st.error(str(exc))
+
+
+@st.dialog("编辑来源")
+def edit_recommendation_source_dialog(source_id: int) -> None:
+    source = get_recommendation_source(source_id)
+    if source is None:
+        st.warning("来源不存在，可能已经被删除。")
+        return
+    with st.form(f"edit_recommendation_source_form_{source_id}"):
+        name = st.text_input("来源名称", value=source["name"])
+        market = st.selectbox(
+            "市场",
+            RECOMMENDATION_MARKETS,
+            index=RECOMMENDATION_MARKETS.index(source.get("market", "美股")),
+        )
+        submitted = st.form_submit_button("保存", type="primary")
+    if submitted:
+        try:
+            update_recommendation_source_mock(source_id, name, market)
+            clear_query_params()
+            rerun()
+        except ValueError as exc:
+            st.error(str(exc))
+
+
+@st.dialog("确认删除")
+def delete_recommendation_source_dialog(source_id: int) -> None:
+    source = get_recommendation_source(source_id)
+    if source is None:
+        st.warning("来源不存在，可能已经被删除。")
+        return
+    st.write(f"确定删除 {source['name']} 吗？")
+    st.caption("当前只是前端假数据，删除后本次会话内该来源及其交易计划会从页面隐藏。")
+    left, right = st.columns(2)
+    if left.button("是", type="primary", width="stretch"):
+        delete_recommendation_source_mock(source_id)
+        clear_query_params()
+        rerun()
+    if right.button("否", width="stretch"):
+        clear_query_params()
+        rerun()
+
+
+def handle_recommendation_source_action() -> None:
+    action = query_param("recommendation_source_action")
+    source_id_value = query_param("source_id")
+    if not action or not source_id_value:
+        return
+    try:
+        source_id = int(source_id_value)
+    except ValueError:
+        clear_query_params()
+        rerun()
+        return
+
+    clear_query_params()
+    if action == "open":
+        source = get_recommendation_source(source_id)
+        if source is not None:
+            st.session_state["selected_trade_source_name"] = source["name"]
+        st.session_state["section"] = "交易管理"
+        st.session_state["page"] = "来源详情"
+        rerun()
+    elif action == "edit":
+        edit_recommendation_source_dialog(source_id)
+    elif action == "delete":
+        delete_recommendation_source_dialog(source_id)
+    elif action == "refresh_prices":
+        source = get_recommendation_source(source_id)
+        if source is not None:
+            st.session_state["selected_trade_source_name"] = source["name"]
+        try:
+            success_count, failures = refresh_trade_source_prices(source_id)
+            if failures:
+                st.warning(f"已更新 {success_count} 个，失败 {len(failures)} 个：{'；'.join(failures[:3])}")
+            else:
+                st.success(f"已更新 {success_count} 个标的价格。")
+            st.session_state["section"] = "交易管理"
+            st.session_state["page"] = "来源详情"
+        except Exception as exc:
+            st.error(f"批量更新失败：{exc}")
+
+
+@st.dialog("新增标的")
+def create_recommendation_plan_dialog(source_id: int) -> None:
+    source = get_recommendation_source(source_id)
+    if source is None:
+        st.warning("来源不存在，可能已经被删除。")
+        return
+    with st.form(f"create_recommendation_plan_form_{source_id}"):
+        symbol = st.text_input("标的代码")
+        name = st.text_input("名称")
+        recommended_at = idea_datetime_input(f"create_recommendation_plan_{source_id}", now_minute_iso())
+        recommendation_price = st.number_input("计划价", min_value=0.0, step=0.01, format="%.2f")
+        current_price = st.number_input("当前价", min_value=0.0, step=0.01, format="%.2f")
+        submitted = st.form_submit_button("保存", type="primary")
+    if submitted:
+        try:
+            create_recommendation_plan_mock(
+                source_id,
+                symbol,
+                name,
+                recommended_at,
+                optional_positive_float(recommendation_price),
+                optional_positive_float(current_price),
+            )
+            st.session_state["selected_trade_source_name"] = source["name"]
+            rerun()
+        except ValueError as exc:
+            st.error(str(exc))
+
+
+@st.dialog("编辑标的")
+def edit_recommendation_plan_dialog(recommendation_id: int) -> None:
+    recommendation = get_recommendation_plan(recommendation_id)
+    if recommendation is None:
+        st.warning("标的不存在，可能已经被删除。")
+        return
+    with st.form(f"edit_recommendation_plan_form_{recommendation_id}"):
+        symbol = st.text_input("标的代码", value=str(recommendation["symbol"]))
+        name = st.text_input("名称", value=str(recommendation["name"]))
+        recommended_at = idea_datetime_input(
+            f"edit_recommendation_plan_{recommendation_id}",
+            recommendation["recommended_at"],
+        )
+        recommendation_price = st.number_input(
+            "计划价",
+            min_value=0.0,
+            value=(
+                float(recommendation["recommendation_price"])
+                if recommendation["recommendation_price"] is not None
+                else 0.0
+            ),
+            step=0.01,
+            format="%.2f",
+        )
+        current_price = st.number_input(
+            "当前价",
+            min_value=0.0,
+            value=(
+                float(recommendation["current_price"])
+                if recommendation["current_price"] is not None
+                else 0.0
+            ),
+            step=0.01,
+            format="%.2f",
+        )
+        submitted = st.form_submit_button("保存", type="primary")
+        delete_submitted = st.form_submit_button("删除")
+    if delete_submitted:
+        delete_recommendation_plan_mock(recommendation_id)
+        clear_query_params()
+        rerun()
+    if submitted:
+        try:
+            update_recommendation_plan_mock(
+                recommendation_id,
+                symbol,
+                name,
+                recommended_at,
+                optional_positive_float(recommendation_price),
+                optional_positive_float(current_price),
+            )
+            clear_query_params()
+            rerun()
+        except ValueError as exc:
+            st.error(str(exc))
+
+
+@st.dialog("删除标的")
+def delete_recommendation_plan_dialog(recommendation_id: int) -> None:
+    recommendation = get_recommendation_plan(recommendation_id)
+    if recommendation is None:
+        st.warning("标的不存在，可能已经被删除。")
+        return
+    st.write(f"确定删除 {recommendation['symbol']} 吗？")
+    left, right = st.columns(2)
+    if left.button("是", type="primary", width="stretch"):
+        delete_recommendation_plan_mock(recommendation_id)
+        return_page = st.session_state.get("recommendation_action_return_page")
+        clear_query_params()
+        if return_page:
+            st.session_state["section"] = "交易管理"
+            st.session_state["page"] = return_page
+            st.session_state.pop("recommendation_action_return_page", None)
+        rerun()
+    if right.button("否", width="stretch"):
+        return_page = st.session_state.get("recommendation_action_return_page")
+        clear_query_params()
+        if return_page:
+            st.session_state["section"] = "交易管理"
+            st.session_state["page"] = return_page
+            st.session_state.pop("recommendation_action_return_page", None)
+        rerun()
+
+
+def handle_recommendation_plan_action() -> None:
+    action = query_param("recommendation_action")
+    recommendation_id_value = query_param("recommendation_id")
+    return_page = query_param("return_page")
+    if not action or not recommendation_id_value:
+        return
+    try:
+        recommendation_id = int(recommendation_id_value)
+    except ValueError:
+        clear_query_params()
+        rerun()
+        return
+
+    recommendation = get_recommendation_plan(recommendation_id)
+    if recommendation is not None:
+        source = get_recommendation_source(int(recommendation["source_id"]))
+        if source is not None:
+            st.session_state["selected_trade_source_name"] = source["name"]
+    if return_page:
+        st.session_state["recommendation_action_return_page"] = return_page
+
+    clear_query_params()
+    if action == "refresh":
+        try:
+            quote = refresh_trade_idea_price(recommendation_id)
+            st.toast(f"{quote.symbol} 已更新：{price(quote.price)}")
+            rerun()
+        except Exception as exc:
+            st.error(f"价格更新失败：{exc}")
+    elif action == "edit":
+        edit_recommendation_plan_dialog(recommendation_id)
+    elif action == "delete":
+        delete_recommendation_plan_dialog(recommendation_id)
+    elif action == "complete":
+        try:
+            complete_recommendation_plan_mock(recommendation_id)
+            rerun()
+        except ValueError as exc:
+            st.error(str(exc))
+    elif action == "restore":
+        trade_services.restore_idea_from_archive(recommendation_id)
+        st.session_state["section"] = "交易管理"
+        st.session_state["page"] = return_page or "交易历史"
+        rerun()
+    elif action == "open_stock":
+        st.session_state["section"] = "交易管理"
+        st.session_state["page"] = "个股操作"
+        st.session_state["selected_trade_recommendation_id"] = recommendation_id
+        rerun()
+
+
+def render_recommendation_source_table(summary: pd.DataFrame) -> None:
+    labels = [
+        "序号",
+        "来源/市场",
+        "标的",
+        "持仓/清仓",
+        "浮动(USD)",
+        "总收益(USD)",
+        "胜率/单票",
+        "操作",
+    ]
+    widths = [5, 28, 8, 12, 13, 14, 12, 8]
+    header = "".join(f"<th>{html.escape(label)}</th>" for label in labels)
+    colgroup = "".join(f"<col style='width: {width}%'>" for width in widths)
+    rows = []
+
+    for row_index, row in summary.sort_values("总收益折算", ascending=False).reset_index(drop=True).iterrows():
+        source_id = int(row["id"])
+        cells = [
+            row_index + 1,
+            (
+                f"<a class='recommendation-link' title='打开来源详情' "
+                f"href='{recommendation_source_action_url('open', source_id)}' target='_self' rel='noreferrer'>"
+                f"{html.escape(str(row['name']))}/{html.escape(str(row['market']))}"
+                f"/{html.escape(str(row['币种']))}</a>"
+            ),
+            int(row["标的数量"]),
+            f"{int(row['持仓数量'])}/{int(row['已清仓数量'])}",
+            colored_money_text(row["浮动盈亏折算"]),
+            colored_money_text(row["总收益折算"]),
+            (
+                f"{float(row['胜率']):.1f}%/"
+                f"{percent_signed(row['单票平均收益率']) if pd.notna(row['单票平均收益率']) else '-'}"
+                if pd.notna(row["胜率"])
+                else "-"
+            ),
+            (
+                "<span class='recommendation-actions'>"
+                f"<a class='recommendation-action' title='编辑' "
+                f"href='{recommendation_source_action_url('edit', source_id)}' target='_self' rel='noreferrer'>✎</a>"
+                f"<a class='recommendation-action danger' title='删除' "
+                f"href='{recommendation_source_action_url('delete', source_id)}' target='_self' rel='noreferrer'>×</a>"
+                "</span>"
+            ),
+        ]
+        cell_html = "".join(
+            f"<td>{cell}</td>"
+            if isinstance(cell, str) and cell.startswith(("<a ", "<span "))
+            else f"<td>{html.escape(str(cell))}</td>"
+            for cell in cells
+        )
+        rows.append(f"<tr>{cell_html}</tr>")
+
+    st.markdown(
+        f"""
+        <style>
+        .recommendation-table {{
+            width: 100%;
+            border-collapse: collapse;
+            table-layout: fixed;
+            margin-top: 0.5rem;
+            margin-bottom: 0.75rem;
+            color: inherit;
+        }}
+        .recommendation-table th,
+        .recommendation-table td {{
+            border: 1px solid rgba(250, 250, 250, 0.18);
+            padding: 0.45rem 0.55rem;
+            line-height: 1.25;
+            vertical-align: middle;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }}
+        .recommendation-table th {{
+            background: rgba(250, 250, 250, 0.06);
+            font-weight: 700;
+        }}
+        .recommendation-actions {{
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.35rem;
+            width: 100%;
+        }}
+        .recommendation-action {{
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 1.45rem;
+            height: 1.45rem;
+            border: 1px solid rgba(250, 250, 250, 0.28);
+            border-radius: 0.2rem;
+            color: inherit;
+            font-weight: 800;
+            text-decoration: none;
+        }}
+        .recommendation-action:hover {{
+            background: rgba(250, 250, 250, 0.12);
+        }}
+        .recommendation-action.danger {{
+            color: #f87171;
+        }}
+        .recommendation-link {{
+            color: inherit;
+            font-weight: 700;
+            text-decoration: none;
+        }}
+        .recommendation-link:hover {{
+            text-decoration: underline;
+        }}
+        </style>
+        <table class="recommendation-table">
+            <colgroup>{colgroup}</colgroup>
+            <thead><tr>{header}</tr></thead>
+            <tbody>{"".join(rows)}</tbody>
+        </table>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def recommendation_price_pair(left: float | None, right: float | None) -> str:
+    return f"{price(left)}/{price(right)}"
+
+
+def recommendation_plan_current_pair(plan_price: float | None, current_price: float | None) -> str:
+    text = recommendation_price_pair(plan_price, current_price)
+    if (
+        plan_price is not None
+        and current_price is not None
+        and pd.notna(plan_price)
+        and pd.notna(current_price)
+        and float(current_price) <= float(plan_price)
+    ):
+        return f"<span class='return-negative'>{html.escape(text)}</span>"
+    return text
+
+
+def parse_idea_datetime(value: object) -> datetime:
+    text = "" if value is None or pd.isna(value) else str(value).strip()
+    if not text:
+        text = now_minute_iso()
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    return datetime.strptime(now_minute_iso(), "%Y-%m-%d %H:%M")
+
+
+def idea_datetime_input(key_prefix: str, value: object) -> str:
+    current = parse_idea_datetime(value)
+    date_col, time_col = st.columns([1, 1])
+    selected_date = date_col.date_input(
+        "提出日期",
+        value=current.date(),
+        key=f"{key_prefix}_idea_date",
+    )
+    selected_time = time_col.time_input(
+        "提出时间",
+        value=current.time().replace(second=0, microsecond=0),
+        key=f"{key_prefix}_idea_time",
+        step=1800,
+    )
+    return f"{selected_date.isoformat()} {selected_time.strftime('%H:%M')}"
+
+
+def recommendation_time_cell(value: object) -> str:
+    text = "" if value is None or pd.isna(value) else str(value).strip()
+    if not text:
+        text = now_minute_iso()
+    if len(text) == 10 and text[4] == "-" and text[7] == "-":
+        text = f"{text} 00:00"
+    return html.escape(text)
+
+
+def refresh_trade_idea_price(idea_id: int) -> market_data.Quote:
+    idea = trade_services.get_idea(idea_id)
+    if idea is None:
+        raise ValueError("标的不存在。")
+    quote = market_data.fetch_latest_price(idea["symbol"])
+    trade_db.update_idea_current_price(idea_id, quote.price)
+    return quote
+
+
+def refresh_trade_source_prices(source_id: int) -> tuple[int, list[str]]:
+    rows = ensure_trade_idea_columns(recommendation_rows())
+    source = get_recommendation_source(source_id)
+    if source is None:
+        raise ValueError("来源不存在。")
+    source_rows = rows[
+        (rows["来源"] == source["name"]) & rows["状态"].isin(["观察中", "持仓中"])
+    ].copy()
+    success_count = 0
+    failures: list[str] = []
+    for _, row in source_rows.iterrows():
+        try:
+            refresh_trade_idea_price(int(row["id"]))
+            success_count += 1
+        except Exception as exc:
+            failures.append(f"{row['标的']}: {exc}")
+    return success_count, failures
+
+
+def render_recommendation_detail_table(frame: pd.DataFrame, source_id: int | None = None) -> None:
+    labels = ["标的/名称", "提出时间", "计划价/当前价", "买入价/卖出价", "持仓/卖出", "浮盈/实盈", "投入/收益率", "操作"]
+    widths = [17, 16, 12, 12, 8, 13, 11, 11]
+    header_cells = []
+    for label in labels:
+        if label == "操作" and source_id is not None:
+            header_cells.append(
+                "<th>"
+                "<span class='recommendation-operation-header'>"
+                "操作"
+                f"<a class='recommendation-action' title='刷新当前表格价格' "
+                f"href='{recommendation_source_refresh_url(source_id)}' target='_self' rel='noreferrer'>↻</a>"
+                "</span>"
+                "</th>"
+            )
+        else:
+            header_cells.append(f"<th>{html.escape(label)}</th>")
+    header = "".join(header_cells)
+    colgroup = "".join(f"<col style='width: {width}%'>" for width in widths)
+    rows = []
+
+    for _, row in frame.iterrows():
+        recommendation_id = int(row["id"])
+        action = (
+            "<span class='recommendation-actions'>"
+            f"<a class='recommendation-action' title='刷新当前价' "
+            f"href='{recommendation_plan_action_url('refresh', recommendation_id)}' target='_self' rel='noreferrer'>↻</a>"
+            f"<a class='recommendation-action' title='编辑' "
+            f"href='{recommendation_plan_action_url('edit', recommendation_id)}' target='_self' rel='noreferrer'>✎</a>"
+            f"<a class='recommendation-action complete' title='完成' "
+            f"href='{recommendation_plan_action_url('complete', recommendation_id)}' target='_self' rel='noreferrer'>✓</a>"
+            "</span>"
+        )
+        cells = [
+            (
+                f"<a class='recommendation-link' title='打开个股操作' "
+                f"href='{stock_operation_url(recommendation_id)}' target='_self' rel='noreferrer'>"
+                f"{html.escape(str(row['标的']))}/{html.escape(str(row['名称']))}</a>"
+            ),
+            recommendation_time_cell(row["提出时间"]),
+            recommendation_plan_current_pair(row["计划价"], row["当前价"]),
+            recommendation_price_pair(row["买入价"], row["卖出价"]),
+            f"{int(row['持仓股数'])}/{int(row['卖出股数'])}股",
+            f"{colored_money_text(row['浮动盈亏'])}/{colored_money_text(row['已实现盈亏'])}",
+            invested_return_text(row["投入金额"], row["总收益率"]),
+            action,
+        ]
+        cell_html = "".join(
+            f"<td>{cell}</td>"
+            if isinstance(cell, str) and cell.startswith(("<a ", "<span "))
+            else f"<td>{html.escape(str(cell))}</td>"
+            for cell in cells
+        )
+        rows.append(f"<tr>{cell_html}</tr>")
+
+    st.markdown(
+        f"""
+        <style>
+        .recommendation-table {{
+            width: 100%;
+            border-collapse: collapse;
+            table-layout: fixed;
+            margin-top: 0.5rem;
+            margin-bottom: 0.75rem;
+            color: inherit;
+        }}
+        .recommendation-table th,
+        .recommendation-table td {{
+            border: 1px solid rgba(250, 250, 250, 0.18);
+            padding: 0.45rem 0.55rem;
+            line-height: 1.25;
+            vertical-align: middle;
+            overflow-wrap: anywhere;
+            white-space: normal;
+        }}
+        .recommendation-table th {{
+            background: rgba(250, 250, 250, 0.06);
+            font-weight: 700;
+        }}
+        .return-positive {{
+            color: #22c55e;
+            font-weight: 700;
+        }}
+        .return-negative {{
+            color: #f87171;
+            font-weight: 700;
+        }}
+        .return-flat {{
+            color: inherit;
+            font-weight: 700;
+        }}
+        .recommendation-actions {{
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.28rem;
+            width: 100%;
+        }}
+        .recommendation-operation-header {{
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.35rem;
+            width: 100%;
+        }}
+        .recommendation-action {{
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 1.35rem;
+            height: 1.35rem;
+            border: 1px solid rgba(250, 250, 250, 0.28);
+            border-radius: 0.2rem;
+            color: inherit;
+            font-weight: 800;
+            text-decoration: none;
+        }}
+        .recommendation-action.complete {{
+            color: #22c55e;
+        }}
+        .recommendation-action.danger {{
+            color: #f87171;
+        }}
+        .recommendation-link {{
+            color: inherit;
+            font-weight: 700;
+            text-decoration: none;
+        }}
+        .recommendation-link:hover {{
+            text-decoration: underline;
+        }}
+        </style>
+        <table class="recommendation-table">
+            <colgroup>{colgroup}</colgroup>
+            <thead><tr>{header}</tr></thead>
+            <tbody>{"".join(rows)}</tbody>
+        </table>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_trade_history_table(frame: pd.DataFrame) -> None:
+    labels = ["标的/名称", "提出时间", "计划价/当前价", "买入价/卖出价", "实盈", "收益率", "状态", "操作"]
+    widths = [20, 17, 13, 13, 10, 9, 9, 9]
+    header = "".join(f"<th>{html.escape(label)}</th>" for label in labels)
+    colgroup = "".join(f"<col style='width: {width}%'>" for width in widths)
+    rows = []
+
+    for _, row in frame.iterrows():
+        recommendation_id = int(row["id"])
+        action = (
+            "<span class='recommendation-actions'>"
+            f"<a class='recommendation-action' title='回收' "
+            f"href='{recommendation_plan_action_url('restore', recommendation_id, '交易历史')}' "
+            "target='_self' rel='noreferrer'>↩</a>"
+            f"<a class='recommendation-action danger' title='删除' "
+            f"href='{recommendation_plan_action_url('delete', recommendation_id, '交易历史')}' "
+            "target='_self' rel='noreferrer'>×</a>"
+            "</span>"
+        )
+        cells = [
+            f"{row['标的']}/{row['名称']}",
+            recommendation_time_cell(row["提出时间"]),
+            recommendation_price_pair(row["计划价"], row["当前价"]),
+            recommendation_price_pair(row["买入价"], row["卖出价"]),
+            colored_money_text(row["已实现盈亏"]),
+            percent_signed(row["已实现盈亏率"]),
+            row["状态"],
+            action,
+        ]
+        cell_html = "".join(
+            f"<td>{cell}</td>"
+            if isinstance(cell, str) and cell.startswith("<span ")
+            else f"<td>{html.escape(str(cell))}</td>"
+            for cell in cells
+        )
+        rows.append(f"<tr>{cell_html}</tr>")
+
+    st.markdown(
+        f"""
+        <style>
+        .recommendation-table {{
+            width: 100%;
+            border-collapse: collapse;
+            table-layout: fixed;
+            margin-top: 0.5rem;
+            margin-bottom: 0.75rem;
+            color: inherit;
+        }}
+        .recommendation-table th,
+        .recommendation-table td {{
+            border: 1px solid rgba(250, 250, 250, 0.18);
+            padding: 0.45rem 0.55rem;
+            line-height: 1.25;
+            vertical-align: middle;
+            overflow-wrap: anywhere;
+            white-space: normal;
+        }}
+        .recommendation-table th {{
+            background: rgba(250, 250, 250, 0.06);
+            font-weight: 700;
+        }}
+        .recommendation-actions {{
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.28rem;
+            width: 100%;
+        }}
+        .recommendation-action {{
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 1.35rem;
+            height: 1.35rem;
+            border: 1px solid rgba(250, 250, 250, 0.28);
+            border-radius: 0.2rem;
+            color: inherit;
+            font-weight: 800;
+            text-decoration: none;
+        }}
+        .recommendation-action.danger {{
+            color: #f87171;
+        }}
+        </style>
+        <table class="recommendation-table">
+            <colgroup>{colgroup}</colgroup>
+            <thead><tr>{header}</tr></thead>
+            <tbody>{"".join(rows)}</tbody>
+        </table>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def render_overview_table(frame: pd.DataFrame) -> None:
     labels = [
         "序号",
@@ -392,7 +1363,7 @@ def render_overview_table(frame: pd.DataFrame) -> None:
             table-layout: fixed;
             margin-top: 0.5rem;
             margin-bottom: 0.75rem;
-            color: #f9fafb;
+            color: inherit;
         }}
         .overview-table th,
         .overview-table td {{
@@ -1145,6 +2116,7 @@ def handle_overview_action() -> None:
 
     if action == "open":
         st.session_state["selected_instrument_id"] = instrument_id
+        st.session_state["section"] = "分档买入管理"
         st.session_state["page"] = "标的详情"
         clear_query_params()
         rerun()
@@ -1354,7 +2326,7 @@ def render_level_status_rows(instrument_id: int) -> None:
             table-layout: fixed;
             margin-top: 0.5rem;
             margin-bottom: 0.75rem;
-            color: #f9fafb;
+            color: inherit;
         }}
         .level-table th,
         .level-table td {{
@@ -1518,40 +2490,945 @@ def backup_page() -> None:
         rerun()
 
 
-def top_navigation(pages: list[str], default_page: str) -> str:
-    columns = st.columns([0.7, 0.9, 0.8, 6])
-    for column, page in zip(columns[: len(pages)], pages, strict=True):
-        if column.button(
-            page,
-            key=f"top_nav_{page}",
-            type="primary" if page == default_page else "secondary",
+def recommendation_overview_page() -> None:
+    handle_recommendation_source_action()
+    summary = recommendation_source_summary()
+    total_invested = summary["投入金额折算"].sum()
+    total_profit = summary["总收益折算"].sum()
+    total_recommendations = int(summary["标的数量"].sum())
+    best_row = summary.sort_values("总收益折算", ascending=False).iloc[0] if not summary.empty else None
+
+    cols = st.columns([1, 1, 1, 1, 1])
+    render_colored_metric(cols[0], "来源数量", str(len(summary)), "inherit")
+    render_colored_metric(cols[1], "标的总数", str(total_recommendations), "inherit")
+    render_colored_metric(cols[2], "总投入(USD)", money(total_invested), "inherit")
+    render_colored_metric(cols[3], "总收益(USD)", money_signed(total_profit), signed_color(total_profit))
+    best_text = f"{best_row['name']} {money_signed(best_row['总收益折算'])}" if best_row is not None else "-"
+    best_color = signed_color(best_row["总收益折算"]) if best_row is not None else "inherit"
+    render_colored_metric(cols[4], "当前最佳", best_text, best_color)
+
+    render_recommendation_source_table(summary)
+
+    left, _ = st.columns([0.35, 6])
+    if left.button("＋", width="stretch", help="新增来源"):
+        create_recommendation_source_dialog()
+
+
+def recommendation_detail_page() -> None:
+    handle_recommendation_source_action()
+    handle_recommendation_plan_action()
+    rows = ensure_trade_idea_columns(recommendation_rows())
+    summary = recommendation_source_summary()
+    if summary.empty:
+        st.info("还没有来源，请先在总览里新增来源。")
+        return
+    source_names = list(summary["name"])
+    selected_source_name = st.session_state.get("selected_trade_source_name")
+    selected_index = source_names.index(selected_source_name) if selected_source_name in source_names else 0
+    selected_source = st.selectbox("来源", source_names, index=selected_index, label_visibility="collapsed")
+    st.session_state["selected_trade_source_name"] = selected_source
+    source_rows = rows[rows["来源"] == selected_source].copy()
+    active_source_rows = source_rows[source_rows["状态"].isin(["观察中", "持仓中"])].copy()
+    active_floating = active_source_rows["浮动盈亏"].fillna(0).sum()
+    active_realized = active_source_rows["已实现盈亏"].fillna(0).sum()
+    active_profit = active_floating + active_realized
+    active_invested = active_source_rows["投入金额"].fillna(0).sum()
+    active_observing = int((active_source_rows["状态"] == "观察中").sum())
+    active_holding = int((active_source_rows["状态"] == "持仓中").sum())
+
+    cols = st.columns([1, 1, 1, 1, 1, 1])
+    render_colored_metric(cols[0], "当前标的", str(len(active_source_rows)), "inherit")
+    render_colored_metric(cols[1], "计划中", str(active_observing), "inherit")
+    render_colored_metric(cols[2], "持仓中", str(active_holding), "inherit")
+    render_colored_metric(cols[3], "总投入", money(active_invested), "inherit")
+    render_colored_metric(cols[4], "浮动盈亏", money_signed(active_floating), signed_color(active_floating))
+    render_colored_metric(cols[5], "总盈亏", money_signed(active_profit), signed_color(active_profit))
+
+    source = next(item for item in recommendation_sources_mock() if item["name"] == selected_source)
+    st.markdown(
+        "\n".join(
+            [
+                f"**来源**：{source['name']}",
+                f"**市场**：{source.get('market', '-')}",
+            ]
+        )
+    )
+
+    st.markdown("**当前计划**")
+    if active_source_rows.empty:
+        st.info("当前来源没有计划中或正在交易的标的。")
+    else:
+        render_recommendation_detail_table(active_source_rows, source_id=int(source["id"]))
+
+    left, _ = st.columns([0.35, 6])
+    if left.button("＋", width="stretch", help="新增标的"):
+        create_recommendation_plan_dialog(int(source["id"]))
+
+
+def trade_history_page() -> None:
+    handle_recommendation_plan_action()
+    rows = ensure_trade_idea_columns(recommendation_rows())
+    if rows.empty:
+        st.info("还没有交易记录。")
+        return
+
+    completed_rows = rows[rows["状态"].isin(["已清仓", "已完成"])].copy()
+    if completed_rows.empty:
+        st.info("还没有已完成的交易。")
+        return
+
+    source_options = list(completed_rows["来源"].drop_duplicates())
+    selected_source = st.selectbox("来源", source_options)
+    completed_rows = completed_rows[completed_rows["来源"] == selected_source].copy()
+
+    total_realized = completed_rows["已实现盈亏"].fillna(0).sum()
+    average_return = completed_rows["已实现盈亏率"].mean()
+    win_rate = (completed_rows["已实现盈亏"].fillna(0) > 0).mean() * 100
+
+    cols = st.columns([1, 1, 1, 1])
+    render_colored_metric(cols[0], "完成数量", str(len(completed_rows)), "inherit")
+    render_colored_metric(cols[1], "实盈合计", money_signed(total_realized), signed_color(total_realized))
+    render_colored_metric(cols[2], "平均收益率", percent_signed(average_return), signed_color(average_return))
+    render_colored_metric(cols[3], "胜率", f"{win_rate:.1f}%", "inherit")
+
+    sorted_rows = completed_rows.sort_values(["来源", "提出时间", "标的"], ascending=[True, False, True])
+    for source_name, source_frame in sorted_rows.groupby("来源", sort=False):
+        source_realized = source_frame["已实现盈亏"].fillna(0).sum()
+        source_average_return = source_frame["已实现盈亏率"].mean()
+        source_win_rate = (source_frame["已实现盈亏"].fillna(0) > 0).mean() * 100
+        st.markdown(
+            (
+                f"**{html.escape(str(source_name))}**  "
+                f"{len(source_frame)}笔 / "
+                f"{html.escape(money_signed(source_realized))} / "
+                f"{html.escape(percent_signed(source_average_return))} / "
+                f"胜率 {source_win_rate:.1f}%"
+            )
+        )
+        render_trade_history_table(source_frame)
+
+
+@st.dialog("买入")
+def buy_trade_dialog(idea_id: int, symbol: str) -> None:
+    with st.form(f"buy_trade_form_{idea_id}"):
+        trade_at = st.text_input("买入时间", value=db.today_iso())
+        price_value = st.number_input("买入价格", min_value=0.0, step=0.01, format="%.2f")
+        shares = st.number_input("股数", min_value=0, step=1)
+        fees = st.number_input("费用", min_value=0.0, step=0.01, format="%.2f")
+        submitted = st.form_submit_button("保存", type="primary")
+    if submitted:
+        try:
+            trade_services.create_order(idea_id, "BUY", trade_at, price_value, int(shares), fees)
+            st.success(f"{symbol} 买入记录已保存。")
+            rerun()
+        except ValueError as exc:
+            st.error(str(exc))
+
+
+@st.dialog("卖出")
+def sell_trade_dialog(idea_id: int, symbol: str) -> None:
+    with st.form(f"sell_trade_form_{idea_id}"):
+        trade_at = st.text_input("卖出时间", value=db.today_iso())
+        price_value = st.number_input("卖出价格", min_value=0.0, step=0.01, format="%.2f")
+        shares = st.number_input("股数", min_value=0, step=1)
+        fees = st.number_input("费用", min_value=0.0, step=0.01, format="%.2f")
+        submitted = st.form_submit_button("保存", type="primary")
+    if submitted:
+        try:
+            trade_services.create_order(idea_id, "SELL", trade_at, price_value, int(shares), fees)
+            st.success(f"{symbol} 卖出记录已保存。")
+            rerun()
+        except ValueError as exc:
+            st.error(str(exc))
+
+
+@st.dialog("编辑交易记录")
+def edit_trade_order_dialog(order_id: int) -> None:
+    order = trade_services.get_order(order_id)
+    if order is None:
+        st.warning("交易记录不存在，可能已经被删除。")
+        return
+    side_options = {"BUY": "买入", "SELL": "卖出"}
+    with st.form(f"edit_trade_order_form_{order_id}"):
+        side_label = st.selectbox(
+            "方向",
+            list(side_options.values()),
+            index=list(side_options).index(order["side"]),
+        )
+        trade_at = st.text_input("交易时间", value=str(order["trade_at"]))
+        price_value = st.number_input(
+            "价格",
+            min_value=0.0,
+            value=float(order["price"]),
+            step=0.01,
+            format="%.2f",
+        )
+        shares = st.number_input("股数", min_value=0, value=int(order["shares"]), step=1)
+        fees = st.number_input(
+            "费用",
+            min_value=0.0,
+            value=float(order["fees"]),
+            step=0.01,
+            format="%.2f",
+        )
+        submitted = st.form_submit_button("保存", type="primary")
+    if submitted:
+        try:
+            side = "BUY" if side_label == "买入" else "SELL"
+            trade_services.update_order(order_id, side, trade_at, price_value, int(shares), fees)
+            st.success("交易记录已保存。")
+            rerun()
+        except ValueError as exc:
+            st.error(str(exc))
+
+
+@st.dialog("删除交易记录")
+def delete_trade_order_dialog(order_id: int) -> None:
+    order = trade_services.get_order(order_id)
+    if order is None:
+        st.warning("交易记录不存在，可能已经被删除。")
+        return
+    st.write("确定删除这条交易记录吗？")
+    left, right = st.columns(2)
+    if left.button("是", type="primary", width="stretch"):
+        trade_services.delete_order(order_id)
+        rerun()
+    if right.button("否", width="stretch"):
+        rerun()
+
+
+def handle_trade_order_action() -> None:
+    action = query_param("trade_order_action")
+    order_id_value = query_param("trade_order_id")
+    if not action or not order_id_value:
+        return
+    try:
+        order_id = int(order_id_value)
+    except ValueError:
+        clear_query_params()
+        rerun()
+        return
+
+    order = trade_services.get_order(order_id)
+    if order is not None:
+        st.session_state["selected_trade_recommendation_id"] = int(order["idea_id"])
+        idea = trade_services.get_idea(int(order["idea_id"]))
+        if idea is not None:
+            source = get_recommendation_source(int(idea["source_id"]))
+            if source is not None:
+                st.session_state["selected_trade_source_name"] = source["name"]
+
+    clear_query_params()
+    if action == "edit":
+        edit_trade_order_dialog(order_id)
+    elif action == "delete":
+        delete_trade_order_dialog(order_id)
+
+
+def render_trade_order_table(trade_rows: list[dict]) -> None:
+    labels = ["方向", "交易时间", "价格", "股数", "费用", "操作"]
+    widths = [12, 28, 16, 12, 16, 16]
+    header = "".join(f"<th>{html.escape(label)}</th>" for label in labels)
+    colgroup = "".join(f"<col style='width: {width}%'>" for width in widths)
+    rows = []
+    for trade in trade_rows:
+        order_id = int(trade["id"])
+        side_text = "买入" if trade["side"] == "BUY" else "卖出"
+        action = (
+            "<span class='trade-order-actions'>"
+            f"<a class='trade-order-action' title='编辑' "
+            f"href='{trade_order_action_url('edit', order_id)}' target='_self' rel='noreferrer'>✎</a>"
+            f"<a class='trade-order-action danger' title='删除' "
+            f"href='{trade_order_action_url('delete', order_id)}' target='_self' rel='noreferrer'>×</a>"
+            "</span>"
+        )
+        cells = [
+            side_text,
+            trade["trade_at"],
+            price(trade["price"]),
+            int(trade["shares"]),
+            price(trade["fees"]),
+            action,
+        ]
+        cell_html = "".join(
+            f"<td>{cell}</td>"
+            if isinstance(cell, str) and cell.startswith("<span ")
+            else f"<td>{html.escape(str(cell))}</td>"
+            for cell in cells
+        )
+        rows.append(f"<tr>{cell_html}</tr>")
+
+    st.markdown(
+        f"""
+        <style>
+        .trade-order-table {{
+            width: 100%;
+            border-collapse: collapse;
+            table-layout: fixed;
+            margin-top: 0.5rem;
+            margin-bottom: 0.75rem;
+            color: inherit;
+        }}
+        .trade-order-table th,
+        .trade-order-table td {{
+            border: 1px solid rgba(250, 250, 250, 0.18);
+            padding: 0.45rem 0.55rem;
+            line-height: 1.25;
+            vertical-align: middle;
+            overflow-wrap: anywhere;
+            white-space: normal;
+        }}
+        .trade-order-table th {{
+            background: rgba(250, 250, 250, 0.06);
+            font-weight: 700;
+        }}
+        .trade-order-actions {{
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.28rem;
+            width: 100%;
+        }}
+        .trade-order-action {{
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 1.35rem;
+            height: 1.35rem;
+            border: 1px solid rgba(250, 250, 250, 0.28);
+            border-radius: 0.2rem;
+            color: inherit;
+            font-weight: 800;
+            text-decoration: none;
+        }}
+        .trade-order-action.danger {{
+            color: #f87171;
+        }}
+        </style>
+        <table class="trade-order-table">
+            <colgroup>{colgroup}</colgroup>
+            <thead><tr>{header}</tr></thead>
+            <tbody>{"".join(rows)}</tbody>
+        </table>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+@st.dialog("创建分档计划")
+def trade_ladder_plan_dialog(idea_id: int) -> None:
+    idea = trade_services.get_idea(idea_id)
+    if idea is None:
+        st.warning("标的不存在，可能已经被删除。")
+        return
+    existing = trade_services.get_ladder_plan_for_idea(idea_id)
+    anchor_default = (
+        float(existing["anchor_price"])
+        if existing is not None
+        else float(idea["plan_price"] or idea["current_price"] or 0)
+    )
+    first_shares_default = int(existing["first_shares"]) if existing is not None else None
+    trigger_default = float(existing["trigger_pct"]) * 100 if existing is not None else None
+    level_count_default = (
+        len(trade_services.ladder_status_rows(idea_id)) if existing is not None else 1
+    )
+    anchor_price = st.number_input(
+        "首档价格",
+        min_value=0.0,
+        value=anchor_default,
+        step=0.01,
+        format="%.2f",
+        key=f"trade_ladder_anchor_{idea_id}",
+    )
+    first_shares = st.number_input(
+        "首档股数",
+        min_value=1,
+        value=first_shares_default,
+        step=1,
+        key=f"trade_ladder_first_shares_{idea_id}",
+    )
+    trigger_pct_percent = st.number_input(
+        "触发比例（%）",
+        min_value=0.0,
+        max_value=99.0,
+        value=trigger_default,
+        step=0.5,
+        format="%.2f",
+        key=f"trade_ladder_trigger_{idea_id}",
+    )
+    level_count = st.number_input(
+        "档位数量",
+        min_value=1,
+        max_value=20,
+        value=max(1, int(level_count_default)),
+        step=1,
+        key=f"trade_ladder_level_count_{idea_id}",
+    )
+
+    preview_levels: list[dict] = []
+    preview_error = ""
+    try:
+        if first_shares is None:
+            raise ValueError("首档股数不能为空。")
+        if trigger_pct_percent is None:
+            raise ValueError("触发比例不能为空。")
+        preview_levels = trade_services.generate_ladder_levels(
+            anchor_price=float(anchor_price),
+            first_shares=int(first_shares),
+            trigger_pct=float(trigger_pct_percent) / 100,
+            level_count=int(level_count),
+        )
+    except ValueError as exc:
+        preview_error = str(exc)
+
+    if preview_error:
+        st.warning(preview_error)
+    elif preview_levels:
+        preview_frame = pd.DataFrame(
+            [
+                {
+                    "LV": f"LV{int(level['level_index'])}",
+                    "目标价": float(level["target_price"]),
+                    "股数": int(level["planned_shares"]),
+                    "金额": float(level["planned_amount"]),
+                }
+                for level in preview_levels
+            ]
+        )
+        st.dataframe(
+            preview_frame,
             width="stretch",
-        ):
-            if page != default_page:
-                st.session_state["page"] = page
-                rerun()
-    return default_page
+            hide_index=True,
+            column_config={
+                "目标价": st.column_config.NumberColumn("目标价", format="%.2f"),
+                "金额": st.column_config.NumberColumn("金额", format="%.2f"),
+            },
+        )
+
+    if st.button("保存", type="primary", width="stretch", disabled=bool(preview_error)):
+        try:
+            trade_services.create_or_replace_ladder_plan(
+                idea_id=idea_id,
+                anchor_price=float(anchor_price),
+                first_shares=int(first_shares),
+                trigger_pct=float(trigger_pct_percent) / 100,
+                level_count=int(level_count),
+            )
+            st.success("分档计划已保存。")
+            rerun()
+        except ValueError as exc:
+            st.error(str(exc))
+
+
+@st.dialog("删除分档计划")
+def delete_trade_ladder_plan_dialog(idea_id: int) -> None:
+    st.write("确定删除这个分档计划吗？")
+    st.caption("已生成的买入记录会保留，但会解除和原 LV 的关联。")
+    left, right = st.columns(2)
+    if left.button("是", type="primary", width="stretch"):
+        trade_services.delete_ladder_plan(idea_id)
+        rerun()
+    if right.button("否", width="stretch"):
+        rerun()
+
+
+@st.dialog("执行分档买入")
+def execute_trade_ladder_level_dialog(level_id: int) -> None:
+    level = trade_db.get_ladder_level(level_id)
+    if level is None:
+        st.warning("分档不存在，可能已经被删除。")
+        return
+    with st.form(f"execute_trade_ladder_level_form_{level_id}"):
+        trade_at = st.text_input("买入时间", value=db.today_iso())
+        price_value = st.number_input(
+            "买入价格",
+            min_value=0.0,
+            value=float(level["target_price"]),
+            step=0.01,
+            format="%.2f",
+        )
+        shares = st.number_input(
+            "股数",
+            min_value=1,
+            value=int(level["planned_shares"]),
+            step=1,
+        )
+        fees = st.number_input("费用", min_value=0.0, value=0.0, step=0.01, format="%.2f")
+        submitted = st.form_submit_button("保存", type="primary")
+    if submitted:
+        try:
+            trade_services.execute_ladder_level(
+                level_id=level_id,
+                trade_at=trade_at,
+                price=price_value,
+                shares=int(shares),
+                fees=fees,
+            )
+            st.success("分档买入记录已保存。")
+            rerun()
+        except ValueError as exc:
+            st.error(str(exc))
+
+
+@st.dialog("执行分档卖出")
+def sell_trade_ladder_level_dialog(level_id: int) -> None:
+    level = trade_db.get_ladder_level(level_id)
+    if level is None:
+        st.warning("分档不存在，可能已经被删除。")
+        return
+    plan = trade_db.get_ladder_plan(int(level["plan_id"]))
+    if plan is None:
+        st.warning("分档计划不存在，可能已经被删除。")
+        return
+    idea = trade_services.get_idea(int(plan["idea_id"]))
+    ladder_row = next(
+        (
+            row
+            for row in trade_services.ladder_status_rows(int(plan["idea_id"]))
+            if int(row["id"]) == int(level_id)
+        ),
+        None,
+    )
+    open_shares = int(ladder_row["open_shares"]) if ladder_row else 0
+    if open_shares <= 0:
+        st.warning("该档位没有可卖出的持仓。")
+        return
+
+    default_price = float(idea["current_price"] or level["target_price"]) if idea else float(level["target_price"])
+    with st.form(f"sell_trade_ladder_level_form_{level_id}"):
+        trade_at = st.text_input("卖出时间", value=db.today_iso())
+        price_value = st.number_input(
+            "卖出价格",
+            min_value=0.0,
+            value=default_price,
+            step=0.01,
+            format="%.2f",
+        )
+        shares = st.number_input(
+            "股数",
+            min_value=1,
+            max_value=open_shares,
+            value=open_shares,
+            step=1,
+        )
+        fees = st.number_input("费用", min_value=0.0, value=0.0, step=0.01, format="%.2f")
+        submitted = st.form_submit_button("保存", type="primary")
+    if submitted:
+        try:
+            trade_services.sell_ladder_level(
+                level_id=level_id,
+                trade_at=trade_at,
+                price=price_value,
+                shares=int(shares),
+                fees=fees,
+            )
+            st.success("分档卖出记录已保存。")
+            rerun()
+        except ValueError as exc:
+            st.error(str(exc))
+
+
+def handle_trade_ladder_action() -> None:
+    action = query_param("trade_ladder_action")
+    level_id_value = query_param("trade_ladder_level_id")
+    if not action or not level_id_value:
+        return
+    try:
+        level_id = int(level_id_value)
+    except ValueError:
+        clear_query_params()
+        rerun()
+        return
+
+    level = trade_db.get_ladder_level(level_id)
+    if level is not None:
+        plan = trade_db.get_ladder_plan(int(level["plan_id"]))
+        if plan is not None:
+            st.session_state["selected_trade_recommendation_id"] = int(plan["idea_id"])
+            idea = trade_services.get_idea(int(plan["idea_id"]))
+            if idea is not None:
+                source = get_recommendation_source(int(idea["source_id"]))
+                if source is not None:
+                    st.session_state["selected_trade_source_name"] = source["name"]
+
+    clear_query_params()
+    if action == "execute":
+        execute_trade_ladder_level_dialog(level_id)
+    elif action == "sell":
+        sell_trade_ladder_level_dialog(level_id)
+
+
+def render_trade_ladder_table(idea_id: int) -> None:
+    rows = trade_services.ladder_status_rows(idea_id)
+    if not rows:
+        return
+    labels = ["LV", "目标价", "计划", "状态", "操作"]
+    widths = [10, 22, 28, 18, 22]
+    header = "".join(f"<th>{html.escape(label)}</th>" for label in labels)
+    colgroup = "".join(f"<col style='width: {width}%'>" for width in widths)
+    body = []
+    for row in rows:
+        action = "-"
+        if row["status"] == "executed":
+            action = (
+                f"<a class='trade-ladder-action danger' title='卖出' "
+                f"href='{trade_ladder_action_url('sell', int(row['id']))}' "
+                "target='_self' rel='noreferrer'>－</a>"
+            )
+        elif row["status"] != "sold":
+            action = (
+                f"<a class='trade-ladder-action' title='买入' "
+                f"href='{trade_ladder_action_url('execute', int(row['id']))}' "
+                "target='_self' rel='noreferrer'>＋</a>"
+            )
+        cells = [
+            f"LV{int(row['level_index'])}",
+            price(row["target_price"]),
+            f"{int(row['planned_shares'])}股/{price(row['planned_amount'])}",
+            row["状态"],
+            action,
+        ]
+        cell_html = "".join(
+            f"<td>{cell}</td>"
+            if isinstance(cell, str) and cell.startswith("<a ")
+            else f"<td>{html.escape(str(cell))}</td>"
+            for cell in cells
+        )
+        body.append(f"<tr class='{html.escape(str(row['status']))}'>{cell_html}</tr>")
+
+    st.markdown(
+        f"""
+        <style>
+        .trade-ladder-table {{
+            width: 100%;
+            border-collapse: collapse;
+            table-layout: fixed;
+            margin-top: 0.5rem;
+            margin-bottom: 0.75rem;
+            color: inherit;
+        }}
+        .trade-ladder-table th,
+        .trade-ladder-table td {{
+            border: 1px solid rgba(250, 250, 250, 0.18);
+            padding: 0.45rem 0.55rem;
+            line-height: 1.25;
+            vertical-align: middle;
+            overflow-wrap: anywhere;
+            white-space: normal;
+        }}
+        .trade-ladder-table th {{
+            background: rgba(250, 250, 250, 0.06);
+            font-weight: 700;
+        }}
+        .trade-ladder-table tr.executed td {{
+            color: #9ca3af;
+        }}
+        .trade-ladder-table tr.sold td {{
+            color: #9ca3af;
+            text-decoration: line-through;
+        }}
+        .trade-ladder-table tr.triggered td {{
+            background: #ffe4e6;
+            color: #7f1d1d;
+            font-weight: 700;
+        }}
+        .trade-ladder-table tr.pending td {{
+            background: #dcfce7;
+            color: #14532d;
+            font-weight: 600;
+        }}
+        .trade-ladder-table tr.unknown td {{
+            background: #f8fafc;
+            color: #334155;
+        }}
+        .trade-ladder-action {{
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 1.35rem;
+            height: 1.35rem;
+            border: 1px solid rgba(250, 250, 250, 0.28);
+            border-radius: 0.2rem;
+            color: inherit;
+            font-weight: 800;
+            text-decoration: none;
+        }}
+        .trade-ladder-action.danger {{
+            color: #f87171;
+        }}
+        </style>
+        <table class="trade-ladder-table">
+            <colgroup>{colgroup}</colgroup>
+            <thead><tr>{header}</tr></thead>
+            <tbody>{"".join(body)}</tbody>
+        </table>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+@st.dialog("编辑标的")
+def edit_trade_plan_dialog(row: pd.Series) -> None:
+    with st.form(f"edit_trade_plan_form_{int(row['id'])}"):
+        symbol = st.text_input("标的代码", value=str(row["标的"]))
+        name = st.text_input("名称", value=str(row["名称"]))
+        plan_at = idea_datetime_input(
+            f"edit_trade_plan_{int(row['id'])}",
+            row["提出时间"],
+        )
+        plan_price = st.number_input(
+            "计划价",
+            min_value=0.0,
+            value=float(row["计划价"]) if pd.notna(row["计划价"]) else 0.0,
+            step=0.01,
+            format="%.2f",
+        )
+        current_price = st.number_input(
+            "当前价",
+            min_value=0.0,
+            value=float(row["当前价"]) if pd.notna(row["当前价"]) else 0.0,
+            step=0.01,
+            format="%.2f",
+        )
+        submitted = st.form_submit_button("保存", type="primary")
+    if submitted:
+        try:
+            trade_services.update_idea(
+                idea_id=int(row["id"]),
+                symbol=symbol,
+                name=name,
+                idea_at=plan_at,
+                plan_price=optional_positive_float(plan_price),
+                current_price=optional_positive_float(current_price),
+            )
+            st.success(f"{symbol.upper()} 已保存。")
+            rerun()
+        except ValueError as exc:
+            st.error(str(exc))
+
+
+def stock_operation_page() -> None:
+    handle_trade_order_action()
+    handle_trade_ladder_action()
+    rows = ensure_trade_idea_columns(recommendation_rows())
+    summary = recommendation_source_summary()
+    if rows.empty or summary.empty:
+        st.info("还没有交易计划，请先在总览里新增来源。")
+        return
+
+    selected_recommendation_id = st.session_state.get("selected_trade_recommendation_id")
+    selected_recommendation = get_recommendation_plan(int(selected_recommendation_id)) if selected_recommendation_id else None
+    if selected_recommendation is not None:
+        selected_source_object = get_recommendation_source(int(selected_recommendation["source_id"]))
+        if selected_source_object is not None:
+            st.session_state["selected_trade_source_name"] = selected_source_object["name"]
+
+    source_names = list(summary["name"])
+    selected_source_name = st.session_state.get("selected_trade_source_name")
+    selected_source_index = source_names.index(selected_source_name) if selected_source_name in source_names else 0
+    selected_source = st.selectbox(
+        "来源",
+        source_names,
+        index=selected_source_index,
+        label_visibility="collapsed",
+    )
+    st.session_state["selected_trade_source_name"] = selected_source
+    source_rows = rows[rows["来源"] == selected_source].copy()
+    if source_rows.empty:
+        st.info("当前来源还没有标的。")
+        return
+
+    symbol_options = [f"{row['标的']}/{row['名称']}" for _, row in source_rows.iterrows()]
+    selected_symbol_index = 0
+    if selected_recommendation is not None:
+        selected_symbol_value = f"{selected_recommendation['symbol']}/{selected_recommendation['name']}"
+        if selected_symbol_value in symbol_options:
+            selected_symbol_index = symbol_options.index(selected_symbol_value)
+    selected_symbol = st.selectbox(
+        "标的",
+        symbol_options,
+        index=selected_symbol_index,
+        label_visibility="collapsed",
+    )
+    selected_symbol_code = selected_symbol.split("/", 1)[0]
+    row = source_rows[source_rows["标的"] == selected_symbol_code].iloc[0]
+    st.session_state["selected_trade_recommendation_id"] = int(row["id"])
+
+    trade_rows = [
+        trade
+        for trade in recommendation_trades_mock()
+        if int(trade["recommendation_id"]) == int(row["id"])
+    ]
+    if trade_rows:
+        metric_cols = st.columns([1, 1, 1, 1, 1, 1])
+        render_colored_metric(metric_cols[0], "当前价", price(row["当前价"]), "inherit")
+        render_colored_metric(metric_cols[1], "计划价", price(row["计划价"]), "inherit")
+        render_colored_metric(
+            metric_cols[2],
+            "买入/卖出均价",
+            recommendation_price_pair(row["买入价"], row["卖出价"]),
+            "inherit",
+        )
+        render_colored_metric(metric_cols[3], "持仓/卖出", f"{int(row['持仓股数'])}/{int(row['卖出股数'])}股", "inherit")
+        render_colored_metric(metric_cols[4], "投入", money(row["投入金额"]), "inherit")
+        render_colored_metric(
+            metric_cols[5],
+            "收益",
+            f"{money_signed(row['总收益'])}/{percent_signed(row['总收益率'])}"
+            if pd.notna(row["总收益"])
+            else "-",
+            signed_color(row["总收益"]),
+        )
+    else:
+        metric_cols = st.columns([1, 1, 1, 1, 1, 1])
+        render_colored_metric(metric_cols[0], "当前价", price(row["当前价"]), "inherit")
+        render_colored_metric(metric_cols[1], "计划价", price(row["计划价"]), "inherit")
+        render_colored_metric(metric_cols[2], "买入/卖出均价", "-/-", "inherit")
+        render_colored_metric(metric_cols[3], "持仓/卖出", "0/0股", "inherit")
+        render_colored_metric(metric_cols[4], "投入", money(row["投入金额"]), "inherit")
+        render_colored_metric(metric_cols[5], "收益", "0.00/+0.00%", "inherit")
+
+    ladder_plan = trade_services.get_ladder_plan_for_idea(int(row["id"]))
+    action_cols = st.columns([0.45, 0.55, 0.55, 5])
+    if action_cols[0].button("↻", help="刷新价格", width="stretch"):
+        try:
+            quote = market_data.fetch_latest_price(str(row["标的"]))
+            trade_db.update_idea_current_price(int(row["id"]), quote.price)
+            st.toast(f"{quote.symbol} 已更新：{price(quote.price)}")
+            rerun()
+        except Exception as exc:
+            st.error(f"价格更新失败：{exc}")
+    if action_cols[1].button(
+        "✚",
+        help="创建或重建分档计划",
+        width="stretch",
+    ):
+        trade_ladder_plan_dialog(int(row["id"]))
+    if action_cols[2].button(
+        "×",
+        disabled=ladder_plan is None,
+        help="删除分档计划",
+        width="stretch",
+    ):
+        delete_trade_ladder_plan_dialog(int(row["id"]))
+
+    if ladder_plan is not None:
+        st.caption(
+            (
+                f"首档 {price(ladder_plan['anchor_price'])} / "
+                f"{int(ladder_plan['first_shares'])}股 / "
+                f"间隔 {float(ladder_plan['trigger_pct']) * 100:.2f}%"
+            )
+        )
+        render_trade_ladder_table(int(row["id"]))
+
+    if trade_rows:
+        st.markdown("**交易记录**")
+        render_trade_order_table(trade_rows)
+    else:
+        st.info("这个标的还没有买卖记录。")
+
+
+def sidebar_navigation(sections: dict[str, list[str]], default_section: str, default_page: str) -> tuple[str, str]:
+    selected_section = default_section
+    selected_page = default_page
+    for section, pages in sections.items():
+        with st.sidebar.expander(section, expanded=(section == default_section)):
+            for page in pages:
+                if st.button(
+                    page,
+                    key=f"sidebar_nav_{section}_{page}",
+                    type="primary"
+                    if section == default_section and page == default_page
+                    else "secondary",
+                    width="stretch",
+                ):
+                    selected_section = section
+                    selected_page = page
+                    st.session_state["section"] = section
+                    st.session_state["page"] = page
+                    if section != default_section or page != default_page:
+                        rerun()
+    return selected_section, selected_page
+
+
+def render_page_heading(section: str, page: str) -> None:
+    st.markdown(
+        (
+            "<div style='margin-bottom: 0.65rem;'>"
+            f"<div style='font-size: 0.78rem; color: #6b7280; line-height: 1.25;'>"
+            f"{html.escape(section)}</div>"
+            f"<div style='font-size: 1.55rem; font-weight: 700; line-height: 1.25;'>"
+            f"{html.escape(page)}</div>"
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
 
 
 def main() -> None:
     db.init_db()
+    trade_db.init_trade_schema()
+    trade_services.seed_demo_data_if_empty()
+    trade_services.sync_all_ladder_plan_prices()
     apply_global_styles()
 
-    pages = ["总览", "标的详情", "数据备份"]
+    sections = {
+        "交易管理": ["总览", "来源详情", "个股操作", "交易历史"],
+        "分档买入管理": ["总览", "标的详情", "数据备份"],
+    }
+    legacy_page_map = {
+        "荐股总览": "总览",
+        "荐股详情": "来源详情",
+    }
+    if st.session_state.get("section") == "荐股管理":
+        st.session_state["section"] = "交易管理"
+    if st.session_state.get("page") in legacy_page_map:
+        st.session_state["page"] = legacy_page_map[st.session_state["page"]]
     if query_param("level_action"):
+        st.session_state["section"] = "分档买入管理"
         st.session_state["page"] = "标的详情"
-    default_page = st.session_state.get("page", "总览")
-    if default_page not in pages:
-        default_page = "总览"
-    page = top_navigation(pages, default_page)
-    st.session_state["page"] = page
+    if query_param("recommendation_source_action"):
+        st.session_state["section"] = "交易管理"
+        if query_param("recommendation_source_action") in {"open", "refresh_prices"}:
+            st.session_state["page"] = "来源详情"
+        else:
+            st.session_state["page"] = "总览"
+    if query_param("recommendation_action"):
+        st.session_state["section"] = "交易管理"
+        st.session_state["page"] = query_param("return_page") or "来源详情"
+    if query_param("trade_order_action"):
+        st.session_state["section"] = "交易管理"
+        st.session_state["page"] = "个股操作"
+    if query_param("trade_ladder_action"):
+        st.session_state["section"] = "交易管理"
+        st.session_state["page"] = "个股操作"
 
-    if page == "总览":
+    default_section = st.session_state.get("section", "交易管理")
+    if default_section not in sections:
+        default_section = "交易管理"
+    default_page = st.session_state.get("page", sections[default_section][0])
+    if default_page not in sections[default_section]:
+        default_page = sections[default_section][0]
+    section, page = sidebar_navigation(sections, default_section, default_page)
+    st.session_state["section"] = section
+    st.session_state["page"] = page
+    render_page_heading(section, page)
+
+    if section == "分档买入管理" and page == "总览":
         overview_page()
-    elif page == "标的详情":
+    elif section == "分档买入管理" and page == "标的详情":
         detail_page()
-    elif page == "数据备份":
+    elif section == "分档买入管理" and page == "数据备份":
         backup_page()
+    elif section == "交易管理" and page == "总览":
+        recommendation_overview_page()
+    elif section == "交易管理" and page == "来源详情":
+        recommendation_detail_page()
+    elif section == "交易管理" and page == "个股操作":
+        stock_operation_page()
+    elif section == "交易管理" and page == "交易历史":
+        trade_history_page()
 
 
 if __name__ == "__main__":
