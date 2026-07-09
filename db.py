@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +11,10 @@ DB_PATH = Path("ladder_buy_manager.sqlite3")
 
 def today_iso() -> str:
     return date.today().isoformat()
+
+
+def now_minute_iso() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M")
 
 
 def get_connection() -> sqlite3.Connection:
