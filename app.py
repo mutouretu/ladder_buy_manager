@@ -166,13 +166,18 @@ def overview_global_action_url(action: str) -> str:
     return "?" + urlencode({"overview_action": action})
 
 
-def recommendation_source_action_url(action: str, source_id: int) -> str:
-    return "?" + urlencode(
-        {
-            "recommendation_source_action": action,
-            "source_id": int(source_id),
-        }
-    )
+def recommendation_source_action_url(
+    action: str,
+    source_id: int,
+    return_page: str | None = None,
+) -> str:
+    params = {
+        "recommendation_source_action": action,
+        "source_id": int(source_id),
+    }
+    if return_page:
+        params["return_page"] = return_page
+    return "?" + urlencode(params)
 
 
 def recommendation_plan_action_url(
@@ -189,13 +194,12 @@ def recommendation_plan_action_url(
     return "?" + urlencode(params)
 
 
-def recommendation_source_refresh_url(source_id: int) -> str:
-    return "?" + urlencode(
-        {
-            "recommendation_source_action": "refresh_prices",
-            "source_id": int(source_id),
-        }
-    )
+def recommendation_source_refresh_url(source_id: int, return_page: str = "项目详情") -> str:
+    return recommendation_source_action_url("refresh_prices", source_id, return_page)
+
+
+def recommendation_global_refresh_url() -> str:
+    return recommendation_source_action_url("refresh_all_prices", 0, "总览")
 
 
 def stock_operation_url(recommendation_id: int) -> str:
@@ -416,6 +420,30 @@ def colored_money_text(value: float | None) -> str:
     return f"<span class='{css_class}'>{html.escape(money_signed(value))}</span>"
 
 
+def overview_total_profit_text(value: float | None, return_pct: float | None) -> str:
+    if value is None or pd.isna(value):
+        return ""
+    numeric = float(value)
+    text = money_signed(numeric)
+    if return_pct is not None:
+        text = f"{text}/{percent_signed(return_pct)}"
+    if numeric > 0:
+        return f"<span class='return-positive'>{html.escape(text)}</span>"
+    if numeric < 0:
+        return f"<span class='return-negative'>{html.escape(text)}</span>"
+    return ""
+
+
+def source_total_return_pct(row: pd.Series) -> float | None:
+    invested = row.get("投入金额折算")
+    total_profit = row.get("总收益折算")
+    if invested is None or total_profit is None or pd.isna(invested) or pd.isna(total_profit):
+        return None
+    if float(invested) <= 0:
+        return None
+    return float(total_profit) / float(invested) * 100
+
+
 def colored_percent_text(value: float | None, none_as_zero: bool = False) -> str:
     if value is None or pd.isna(value):
         if not none_as_zero:
@@ -590,10 +618,10 @@ def recommendation_source_summary() -> pd.DataFrame:
     return trade_services.source_summary()
 
 
-@st.dialog("新增来源")
+@st.dialog("新增项目")
 def create_recommendation_source_dialog() -> None:
     with st.form("create_recommendation_source_form"):
-        name = st.text_input("来源名称")
+        name = st.text_input("项目名称")
         market = st.selectbox("市场", RECOMMENDATION_MARKETS)
         submitted = st.form_submit_button("保存", type="primary")
     if submitted:
@@ -604,14 +632,14 @@ def create_recommendation_source_dialog() -> None:
             st.error(str(exc))
 
 
-@st.dialog("编辑来源")
+@st.dialog("编辑项目")
 def edit_recommendation_source_dialog(source_id: int) -> None:
     source = get_recommendation_source(source_id)
     if source is None:
-        st.warning("来源不存在，可能已经被删除。")
+        st.warning("项目不存在，可能已经被删除。")
         return
     with st.form(f"edit_recommendation_source_form_{source_id}"):
-        name = st.text_input("来源名称", value=source["name"])
+        name = st.text_input("项目名称", value=source["name"])
         market = st.selectbox(
             "市场",
             RECOMMENDATION_MARKETS,
@@ -631,10 +659,10 @@ def edit_recommendation_source_dialog(source_id: int) -> None:
 def delete_recommendation_source_dialog(source_id: int) -> None:
     source = get_recommendation_source(source_id)
     if source is None:
-        st.warning("来源不存在，可能已经被删除。")
+        st.warning("项目不存在，可能已经被删除。")
         return
     st.write(f"确定删除 {source['name']} 吗？")
-    st.caption("当前只是前端假数据，删除后本次会话内该来源及其交易计划会从页面隐藏。")
+    st.caption("删除后该项目及其交易计划会从页面隐藏。")
     left, right = st.columns(2)
     if left.button("是", type="primary", width="stretch"):
         delete_recommendation_source_mock(source_id)
@@ -648,6 +676,7 @@ def delete_recommendation_source_dialog(source_id: int) -> None:
 def handle_recommendation_source_action() -> None:
     action = query_param("recommendation_source_action")
     source_id_value = query_param("source_id")
+    return_page = query_param("return_page") or "总览"
     if not action or not source_id_value:
         return
     try:
@@ -663,7 +692,7 @@ def handle_recommendation_source_action() -> None:
         if source is not None:
             st.session_state["selected_trade_source_name"] = source["name"]
         st.session_state["section"] = "交易管理"
-        st.session_state["page"] = "来源详情"
+        st.session_state["page"] = "项目详情"
         rerun()
     elif action == "edit":
         edit_recommendation_source_dialog(source_id)
@@ -680,16 +709,27 @@ def handle_recommendation_source_action() -> None:
             else:
                 st.success(f"已更新 {success_count} 个标的价格。")
             st.session_state["section"] = "交易管理"
-            st.session_state["page"] = "来源详情"
+            st.session_state["page"] = return_page
         except Exception as exc:
             st.error(f"批量更新失败：{exc}")
+    elif action == "refresh_all_prices":
+        try:
+            success_count, failures = refresh_all_trade_prices()
+            if failures:
+                st.warning(f"已更新 {success_count} 个，失败 {len(failures)} 个：{'；'.join(failures[:5])}")
+            else:
+                st.success(f"已更新 {success_count} 个标的价格。")
+            st.session_state["section"] = "交易管理"
+            st.session_state["page"] = return_page
+        except Exception as exc:
+            st.error(f"全部更新失败：{exc}")
 
 
 @st.dialog("新增标的")
 def create_recommendation_plan_dialog(source_id: int) -> None:
     source = get_recommendation_source(source_id)
     if source is None:
-        st.warning("来源不存在，可能已经被删除。")
+        st.warning("项目不存在，可能已经被删除。")
         return
     with st.form(f"create_recommendation_plan_form_{source_id}"):
         symbol = st.text_input("标的代码")
@@ -802,6 +842,10 @@ def handle_recommendation_plan_action() -> None:
     action = query_param("recommendation_action")
     recommendation_id_value = query_param("recommendation_id")
     return_page = query_param("return_page")
+    if return_page == "交易历史":
+        return_page = "项目详情"
+    if return_page == "来源详情":
+        return_page = "项目详情"
     if not action or not recommendation_id_value:
         return
     try:
@@ -838,9 +882,9 @@ def handle_recommendation_plan_action() -> None:
         except ValueError as exc:
             st.error(str(exc))
     elif action == "restore":
-        trade_services.restore_idea_from_archive(recommendation_id)
+        trade_services.recover_idea_to_watchlist(recommendation_id)
         st.session_state["section"] = "交易管理"
-        st.session_state["page"] = return_page or "交易历史"
+        st.session_state["page"] = "项目详情"
         rerun()
     elif action == "open_stock":
         st.session_state["section"] = "交易管理"
@@ -852,25 +896,40 @@ def handle_recommendation_plan_action() -> None:
 def render_recommendation_source_table(summary: pd.DataFrame) -> None:
     labels = [
         "序号",
-        "来源/市场",
+        "项目/市场",
         "标的",
         "持仓/清仓",
         "浮动(USD)",
-        "总收益(USD)",
-        "胜率/单票",
+        "总收益/收益率",
+        "胜率",
         "操作",
     ]
     widths = [5, 28, 8, 12, 13, 14, 12, 8]
-    header = "".join(f"<th>{html.escape(label)}</th>" for label in labels)
+    header_cells = []
+    for label in labels:
+        if label == "操作":
+            header_cells.append(
+                "<th>"
+                "<span class='recommendation-operation-header'>"
+                "操作"
+                f"<a class='recommendation-action' title='刷新全部观察和持仓价格' "
+                f"href='{recommendation_global_refresh_url()}' target='_self' rel='noreferrer'>↻</a>"
+                "</span>"
+                "</th>"
+            )
+        else:
+            header_cells.append(f"<th>{html.escape(label)}</th>")
+    header = "".join(header_cells)
     colgroup = "".join(f"<col style='width: {width}%'>" for width in widths)
     rows = []
 
     for row_index, row in summary.sort_values("总收益折算", ascending=False).reset_index(drop=True).iterrows():
         source_id = int(row["id"])
+        total_return_pct = source_total_return_pct(row)
         cells = [
             row_index + 1,
             (
-                f"<a class='recommendation-link' title='打开来源详情' "
+                f"<a class='recommendation-link' title='打开项目详情' "
                 f"href='{recommendation_source_action_url('open', source_id)}' target='_self' rel='noreferrer'>"
                 f"{html.escape(str(row['name']))}/{html.escape(str(row['market']))}"
                 f"/{html.escape(str(row['币种']))}</a>"
@@ -878,15 +937,16 @@ def render_recommendation_source_table(summary: pd.DataFrame) -> None:
             int(row["标的数量"]),
             f"{int(row['持仓数量'])}/{int(row['已清仓数量'])}",
             colored_money_text(row["浮动盈亏折算"]),
-            colored_money_text(row["总收益折算"]),
+            overview_total_profit_text(row["总收益折算"], total_return_pct),
             (
-                f"{float(row['胜率']):.1f}%/"
-                f"{percent_signed(row['单票平均收益率']) if pd.notna(row['单票平均收益率']) else '-'}"
+                f"{float(row['胜率']):.1f}%"
                 if pd.notna(row["胜率"])
                 else "-"
             ),
             (
                 "<span class='recommendation-actions'>"
+                f"<a class='recommendation-action' title='刷新该项目价格' "
+                f"href='{recommendation_source_refresh_url(source_id, '总览')}' target='_self' rel='noreferrer'>↻</a>"
                 f"<a class='recommendation-action' title='编辑' "
                 f"href='{recommendation_source_action_url('edit', source_id)}' target='_self' rel='noreferrer'>✎</a>"
                 f"<a class='recommendation-action danger' title='删除' "
@@ -934,6 +994,13 @@ def render_recommendation_source_table(summary: pd.DataFrame) -> None:
             gap: 0.35rem;
             width: 100%;
         }}
+        .recommendation-operation-header {{
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.35rem;
+            width: 100%;
+        }}
         .recommendation-action {{
             display: inline-flex;
             align-items: center;
@@ -951,6 +1018,14 @@ def render_recommendation_source_table(summary: pd.DataFrame) -> None:
         }}
         .recommendation-action.danger {{
             color: #f87171;
+        }}
+        .recommendation-table .return-positive {{
+            color: #22c55e;
+            font-weight: 700;
+        }}
+        .recommendation-table .return-negative {{
+            color: #f87171;
+            font-weight: 700;
         }}
         .recommendation-link {{
             color: inherit;
@@ -1039,13 +1114,27 @@ def refresh_trade_source_prices(source_id: int) -> tuple[int, list[str]]:
     rows = ensure_trade_idea_columns(recommendation_rows())
     source = get_recommendation_source(source_id)
     if source is None:
-        raise ValueError("来源不存在。")
+        raise ValueError("项目不存在。")
     source_rows = rows[
         (rows["来源"] == source["name"]) & rows["状态"].isin(["观察中", "持仓中"])
     ].copy()
     success_count = 0
     failures: list[str] = []
     for _, row in source_rows.iterrows():
+        try:
+            refresh_trade_idea_price(int(row["id"]))
+            success_count += 1
+        except Exception as exc:
+            failures.append(f"{row['标的']}: {exc}")
+    return success_count, failures
+
+
+def refresh_all_trade_prices() -> tuple[int, list[str]]:
+    rows = ensure_trade_idea_columns(recommendation_rows())
+    active_rows = rows[rows["状态"].isin(["观察中", "持仓中"])].copy()
+    success_count = 0
+    failures: list[str] = []
+    for _, row in active_rows.iterrows():
         try:
             refresh_trade_idea_price(int(row["id"]))
             success_count += 1
@@ -1196,7 +1285,7 @@ def render_recommendation_detail_table(frame: pd.DataFrame, source_id: int | Non
     )
 
 
-def render_trade_history_table(frame: pd.DataFrame) -> None:
+def render_trade_history_table(frame: pd.DataFrame, return_page: str = "项目详情") -> None:
     labels = ["标的/名称", "提出时间", "计划价/当前价", "买入价/卖出价", "实盈", "收益率", "状态", "操作"]
     widths = [20, 17, 13, 13, 10, 9, 9, 9]
     header = "".join(f"<th>{html.escape(label)}</th>" for label in labels)
@@ -1208,10 +1297,10 @@ def render_trade_history_table(frame: pd.DataFrame) -> None:
         action = (
             "<span class='recommendation-actions'>"
             f"<a class='recommendation-action' title='回收' "
-            f"href='{recommendation_plan_action_url('restore', recommendation_id, '交易历史')}' "
+            f"href='{recommendation_plan_action_url('restore', recommendation_id, return_page)}' "
             "target='_self' rel='noreferrer'>↩</a>"
             f"<a class='recommendation-action danger' title='删除' "
-            f"href='{recommendation_plan_action_url('delete', recommendation_id, '交易历史')}' "
+            f"href='{recommendation_plan_action_url('delete', recommendation_id, return_page)}' "
             "target='_self' rel='noreferrer'>×</a>"
             "</span>"
         )
@@ -2499,7 +2588,7 @@ def recommendation_overview_page() -> None:
     best_row = summary.sort_values("总收益折算", ascending=False).iloc[0] if not summary.empty else None
 
     cols = st.columns([1, 1, 1, 1, 1])
-    render_colored_metric(cols[0], "来源数量", str(len(summary)), "inherit")
+    render_colored_metric(cols[0], "项目数量", str(len(summary)), "inherit")
     render_colored_metric(cols[1], "标的总数", str(total_recommendations), "inherit")
     render_colored_metric(cols[2], "总投入(USD)", money(total_invested), "inherit")
     render_colored_metric(cols[3], "总收益(USD)", money_signed(total_profit), signed_color(total_profit))
@@ -2510,7 +2599,7 @@ def recommendation_overview_page() -> None:
     render_recommendation_source_table(summary)
 
     left, _ = st.columns([0.35, 6])
-    if left.button("＋", width="stretch", help="新增来源"):
+    if left.button("＋", width="stretch", help="新增项目"):
         create_recommendation_source_dialog()
 
 
@@ -2520,35 +2609,38 @@ def recommendation_detail_page() -> None:
     rows = ensure_trade_idea_columns(recommendation_rows())
     summary = recommendation_source_summary()
     if summary.empty:
-        st.info("还没有来源，请先在总览里新增来源。")
+        st.info("还没有项目，请先在总览里新增项目。")
         return
     source_names = list(summary["name"])
     selected_source_name = st.session_state.get("selected_trade_source_name")
     selected_index = source_names.index(selected_source_name) if selected_source_name in source_names else 0
-    selected_source = st.selectbox("来源", source_names, index=selected_index, label_visibility="collapsed")
+    selected_source = st.selectbox("项目", source_names, index=selected_index, label_visibility="collapsed")
     st.session_state["selected_trade_source_name"] = selected_source
     source_rows = rows[rows["来源"] == selected_source].copy()
     active_source_rows = source_rows[source_rows["状态"].isin(["观察中", "持仓中"])].copy()
-    active_floating = active_source_rows["浮动盈亏"].fillna(0).sum()
-    active_realized = active_source_rows["已实现盈亏"].fillna(0).sum()
-    active_profit = active_floating + active_realized
-    active_invested = active_source_rows["投入金额"].fillna(0).sum()
+    completed_source_rows = source_rows[source_rows["状态"].isin(["已清仓", "已完成"])].copy()
+    source_floating = source_rows["浮动盈亏"].fillna(0).sum()
+    source_realized = source_rows["已实现盈亏"].fillna(0).sum()
+    source_profit = source_floating + source_realized
+    source_invested = source_rows["投入金额"].fillna(0).sum()
     active_observing = int((active_source_rows["状态"] == "观察中").sum())
     active_holding = int((active_source_rows["状态"] == "持仓中").sum())
+    completed_count = len(completed_source_rows)
 
-    cols = st.columns([1, 1, 1, 1, 1, 1])
-    render_colored_metric(cols[0], "当前标的", str(len(active_source_rows)), "inherit")
+    cols = st.columns([1, 1, 1, 1, 1, 1, 1])
+    render_colored_metric(cols[0], "总标的", str(len(source_rows)), "inherit")
     render_colored_metric(cols[1], "计划中", str(active_observing), "inherit")
     render_colored_metric(cols[2], "持仓中", str(active_holding), "inherit")
-    render_colored_metric(cols[3], "总投入", money(active_invested), "inherit")
-    render_colored_metric(cols[4], "浮动盈亏", money_signed(active_floating), signed_color(active_floating))
-    render_colored_metric(cols[5], "总盈亏", money_signed(active_profit), signed_color(active_profit))
+    render_colored_metric(cols[3], "已完成", str(completed_count), "inherit")
+    render_colored_metric(cols[4], "总投入", money(source_invested), "inherit")
+    render_colored_metric(cols[5], "浮动盈亏", money_signed(source_floating), signed_color(source_floating))
+    render_colored_metric(cols[6], "总盈亏", money_signed(source_profit), signed_color(source_profit))
 
     source = next(item for item in recommendation_sources_mock() if item["name"] == selected_source)
     st.markdown(
         "\n".join(
             [
-                f"**来源**：{source['name']}",
+                f"**项目**：{source['name']}",
                 f"**市场**：{source.get('market', '-')}",
             ]
         )
@@ -2556,7 +2648,7 @@ def recommendation_detail_page() -> None:
 
     st.markdown("**当前计划**")
     if active_source_rows.empty:
-        st.info("当前来源没有计划中或正在交易的标的。")
+        st.info("当前项目没有计划中或正在交易的标的。")
     else:
         render_recommendation_detail_table(active_source_rows, source_id=int(source["id"]))
 
@@ -2564,48 +2656,15 @@ def recommendation_detail_page() -> None:
     if left.button("＋", width="stretch", help="新增标的"):
         create_recommendation_plan_dialog(int(source["id"]))
 
-
-def trade_history_page() -> None:
-    handle_recommendation_plan_action()
-    rows = ensure_trade_idea_columns(recommendation_rows())
-    if rows.empty:
-        st.info("还没有交易记录。")
-        return
-
-    completed_rows = rows[rows["状态"].isin(["已清仓", "已完成"])].copy()
-    if completed_rows.empty:
-        st.info("还没有已完成的交易。")
-        return
-
-    source_options = list(completed_rows["来源"].drop_duplicates())
-    selected_source = st.selectbox("来源", source_options)
-    completed_rows = completed_rows[completed_rows["来源"] == selected_source].copy()
-
-    total_realized = completed_rows["已实现盈亏"].fillna(0).sum()
-    average_return = completed_rows["已实现盈亏率"].mean()
-    win_rate = (completed_rows["已实现盈亏"].fillna(0) > 0).mean() * 100
-
-    cols = st.columns([1, 1, 1, 1])
-    render_colored_metric(cols[0], "完成数量", str(len(completed_rows)), "inherit")
-    render_colored_metric(cols[1], "实盈合计", money_signed(total_realized), signed_color(total_realized))
-    render_colored_metric(cols[2], "平均收益率", percent_signed(average_return), signed_color(average_return))
-    render_colored_metric(cols[3], "胜率", f"{win_rate:.1f}%", "inherit")
-
-    sorted_rows = completed_rows.sort_values(["来源", "提出时间", "标的"], ascending=[True, False, True])
-    for source_name, source_frame in sorted_rows.groupby("来源", sort=False):
-        source_realized = source_frame["已实现盈亏"].fillna(0).sum()
-        source_average_return = source_frame["已实现盈亏率"].mean()
-        source_win_rate = (source_frame["已实现盈亏"].fillna(0) > 0).mean() * 100
-        st.markdown(
-            (
-                f"**{html.escape(str(source_name))}**  "
-                f"{len(source_frame)}笔 / "
-                f"{html.escape(money_signed(source_realized))} / "
-                f"{html.escape(percent_signed(source_average_return))} / "
-                f"胜率 {source_win_rate:.1f}%"
-            )
+    st.markdown("**交易历史**")
+    if completed_source_rows.empty:
+        st.info("当前项目还没有已完成的交易。")
+    else:
+        sorted_completed_rows = completed_source_rows.sort_values(
+            ["提出时间", "标的"],
+            ascending=[False, True],
         )
-        render_trade_history_table(source_frame)
+        render_trade_history_table(sorted_completed_rows, return_page="项目详情")
 
 
 @st.dialog("买入")
@@ -3213,7 +3272,7 @@ def stock_operation_page() -> None:
     rows = ensure_trade_idea_columns(recommendation_rows())
     summary = recommendation_source_summary()
     if rows.empty or summary.empty:
-        st.info("还没有交易计划，请先在总览里新增来源。")
+        st.info("还没有交易计划，请先在总览里新增项目。")
         return
 
     selected_recommendation_id = st.session_state.get("selected_trade_recommendation_id")
@@ -3227,7 +3286,7 @@ def stock_operation_page() -> None:
     selected_source_name = st.session_state.get("selected_trade_source_name")
     selected_source_index = source_names.index(selected_source_name) if selected_source_name in source_names else 0
     selected_source = st.selectbox(
-        "来源",
+        "项目",
         source_names,
         index=selected_source_index,
         label_visibility="collapsed",
@@ -3235,7 +3294,7 @@ def stock_operation_page() -> None:
     st.session_state["selected_trade_source_name"] = selected_source
     source_rows = rows[rows["来源"] == selected_source].copy()
     if source_rows.empty:
-        st.info("当前来源还没有标的。")
+        st.info("当前项目还没有标的。")
         return
 
     symbol_options = [f"{row['标的']}/{row['名称']}" for _, row in source_rows.iterrows()]
@@ -3374,12 +3433,13 @@ def main() -> None:
     apply_global_styles()
 
     sections = {
-        "交易管理": ["总览", "来源详情", "个股操作", "交易历史"],
+        "交易管理": ["总览", "项目详情", "个股操作"],
         "分档买入管理": ["总览", "标的详情", "数据备份"],
     }
     legacy_page_map = {
         "荐股总览": "总览",
-        "荐股详情": "来源详情",
+        "荐股详情": "项目详情",
+        "来源详情": "项目详情",
     }
     if st.session_state.get("section") == "荐股管理":
         st.session_state["section"] = "交易管理"
@@ -3390,13 +3450,21 @@ def main() -> None:
         st.session_state["page"] = "标的详情"
     if query_param("recommendation_source_action"):
         st.session_state["section"] = "交易管理"
-        if query_param("recommendation_source_action") in {"open", "refresh_prices"}:
-            st.session_state["page"] = "来源详情"
+        source_return_page = query_param("return_page")
+        if source_return_page == "来源详情":
+            source_return_page = "项目详情"
+        if source_return_page:
+            st.session_state["page"] = source_return_page
+        elif query_param("recommendation_source_action") == "open":
+            st.session_state["page"] = "项目详情"
         else:
             st.session_state["page"] = "总览"
     if query_param("recommendation_action"):
         st.session_state["section"] = "交易管理"
-        st.session_state["page"] = query_param("return_page") or "来源详情"
+        action_return_page = query_param("return_page") or "项目详情"
+        if action_return_page == "来源详情":
+            action_return_page = "项目详情"
+        st.session_state["page"] = action_return_page
     if query_param("trade_order_action"):
         st.session_state["section"] = "交易管理"
         st.session_state["page"] = "个股操作"
@@ -3423,12 +3491,10 @@ def main() -> None:
         backup_page()
     elif section == "交易管理" and page == "总览":
         recommendation_overview_page()
-    elif section == "交易管理" and page == "来源详情":
+    elif section == "交易管理" and page == "项目详情":
         recommendation_detail_page()
     elif section == "交易管理" and page == "个股操作":
         stock_operation_page()
-    elif section == "交易管理" and page == "交易历史":
-        trade_history_page()
 
 
 if __name__ == "__main__":

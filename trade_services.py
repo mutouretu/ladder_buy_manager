@@ -79,10 +79,12 @@ def display_idea_at(idea_at: str | None) -> str:
 def normalize_status(status: str | None, position_shares: int, has_trade: bool) -> str:
     if status == "completed":
         return "已完成"
-    if not has_trade:
-        return "观察中"
-    if position_shares > 0:
+    if status == "closed":
+        return "已清仓"
+    if position_shares > 0 or status == "holding":
         return "持仓中"
+    if status == "watching" or not has_trade:
+        return "观察中"
     return "已清仓"
 
 
@@ -101,20 +103,20 @@ def get_source_by_name(name: str) -> sqlite3.Row | None:
 def create_source(name: str, market: str) -> int:
     cleaned_name = name.strip()
     if not cleaned_name:
-        raise ValueError("来源名称不能为空。")
+        raise ValueError("项目名称不能为空。")
     existing = trade_db.get_source_by_name(cleaned_name)
     if existing is not None:
-        raise ValueError("来源名称已存在。")
+        raise ValueError("项目名称已存在。")
     return trade_db.create_source(cleaned_name, market)
 
 
 def update_source(source_id: int, name: str, market: str) -> None:
     cleaned_name = name.strip()
     if not cleaned_name:
-        raise ValueError("来源名称不能为空。")
+        raise ValueError("项目名称不能为空。")
     existing = trade_db.get_source_by_name(cleaned_name)
     if existing is not None and int(existing["id"]) != int(source_id):
-        raise ValueError("来源名称已存在。")
+        raise ValueError("项目名称已存在。")
     trade_db.update_source(source_id, cleaned_name, market)
 
 
@@ -472,14 +474,21 @@ def restore_idea_from_archive(idea_id: int) -> None:
         return
     orders = trade_db.list_orders(idea_id)
     buy_shares = sum(int(order["shares"]) for order in orders if order["side"] == "BUY")
-    sell_shares = sum(int(order["shares"]) for order in orders if order["side"] == "SELL")
-    position_shares = buy_shares - sell_shares
     if not orders:
         next_status = "watching"
-    elif position_shares > 0:
+    elif buy_shares > 0:
         next_status = "holding"
     else:
-        next_status = "closed"
+        next_status = "watching"
+    trade_db.update_idea_status(idea_id, next_status)
+
+
+def recover_idea_to_watchlist(idea_id: int) -> None:
+    if trade_db.get_idea(idea_id) is None:
+        return
+    orders = trade_db.list_orders(idea_id)
+    buy_shares = sum(int(order["shares"]) for order in orders if order["side"] == "BUY")
+    next_status = "holding" if buy_shares > 0 else "watching"
     trade_db.update_idea_status(idea_id, next_status)
 
 
