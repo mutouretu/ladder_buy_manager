@@ -21,7 +21,7 @@ trade_db = importlib.reload(trade_db)
 trade_services = importlib.reload(trade_services)
 
 
-st.set_page_config(page_title="分档买入管理器", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="交易管理", layout="wide", initial_sidebar_state="expanded")
 
 
 def now_minute_iso() -> str:
@@ -3434,7 +3434,6 @@ def main() -> None:
 
     sections = {
         "交易管理": ["总览", "项目详情", "个股操作"],
-        "分档买入管理": ["总览", "标的详情", "数据备份"],
     }
     legacy_page_map = {
         "荐股总览": "总览",
@@ -3446,8 +3445,8 @@ def main() -> None:
     if st.session_state.get("page") in legacy_page_map:
         st.session_state["page"] = legacy_page_map[st.session_state["page"]]
     if query_param("level_action"):
-        st.session_state["section"] = "分档买入管理"
-        st.session_state["page"] = "标的详情"
+        st.session_state["section"] = "交易管理"
+        st.session_state["page"] = "总览"
     if query_param("recommendation_source_action"):
         st.session_state["section"] = "交易管理"
         source_return_page = query_param("return_page")
