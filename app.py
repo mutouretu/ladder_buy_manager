@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import importlib
+import os
 import sqlite3
 from datetime import datetime
 from urllib.parse import urlencode
@@ -3428,7 +3429,8 @@ def render_page_heading(section: str, page: str) -> None:
 def main() -> None:
     db.init_db()
     trade_db.init_trade_schema()
-    trade_services.seed_demo_data_if_empty()
+    if os.environ.get("LADDER_BUY_MANAGER_SEED_DEMO") == "1":
+        trade_services.seed_demo_data_if_empty()
     trade_services.sync_all_ladder_plan_prices()
     apply_global_styles()
 
