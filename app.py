@@ -736,8 +736,6 @@ def create_recommendation_plan_dialog(source_id: int) -> None:
         symbol = st.text_input("标的代码")
         name = st.text_input("名称")
         recommended_at = idea_datetime_input(f"create_recommendation_plan_{source_id}", now_minute_iso())
-        recommendation_price = st.number_input("计划价", min_value=0.0, step=0.01, format="%.2f")
-        current_price = st.number_input("当前价", min_value=0.0, step=0.01, format="%.2f")
         submitted = st.form_submit_button("保存", type="primary")
     if submitted:
         try:
@@ -746,8 +744,8 @@ def create_recommendation_plan_dialog(source_id: int) -> None:
                 symbol,
                 name,
                 recommended_at,
-                optional_positive_float(recommendation_price),
-                optional_positive_float(current_price),
+                None,
+                None,
             )
             st.session_state["selected_trade_source_name"] = source["name"]
             rerun()
@@ -1089,6 +1087,23 @@ def idea_datetime_input(key_prefix: str, value: object) -> str:
         value=current.time().replace(second=0, microsecond=0),
         key=f"{key_prefix}_idea_time",
         step=1800,
+    )
+    return f"{selected_date.isoformat()} {selected_time.strftime('%H:%M')}"
+
+
+def trade_datetime_input(key_prefix: str, label_prefix: str, value: object) -> str:
+    current = parse_idea_datetime(value)
+    date_col, time_col = st.columns([1, 1])
+    selected_date = date_col.date_input(
+        f"{label_prefix}日期",
+        value=current.date(),
+        key=f"{key_prefix}_trade_date",
+    )
+    selected_time = time_col.time_input(
+        f"{label_prefix}时间",
+        value=current.time().replace(second=0, microsecond=0),
+        key=f"{key_prefix}_trade_time",
+        step=60,
     )
     return f"{selected_date.isoformat()} {selected_time.strftime('%H:%M')}"
 
@@ -2668,7 +2683,7 @@ def recommendation_detail_page() -> None:
 @st.dialog("买入")
 def buy_trade_dialog(idea_id: int, symbol: str) -> None:
     with st.form(f"buy_trade_form_{idea_id}"):
-        trade_at = st.text_input("买入时间", value=db.today_iso())
+        trade_at = trade_datetime_input(f"buy_trade_{idea_id}", "买入", now_minute_iso())
         price_value = st.number_input("买入价格", min_value=0.0, step=0.01, format="%.2f")
         shares = st.number_input("股数", min_value=0, step=1)
         fees = st.number_input("费用", min_value=0.0, step=0.01, format="%.2f")
@@ -2685,7 +2700,7 @@ def buy_trade_dialog(idea_id: int, symbol: str) -> None:
 @st.dialog("卖出")
 def sell_trade_dialog(idea_id: int, symbol: str) -> None:
     with st.form(f"sell_trade_form_{idea_id}"):
-        trade_at = st.text_input("卖出时间", value=db.today_iso())
+        trade_at = trade_datetime_input(f"sell_trade_{idea_id}", "卖出", now_minute_iso())
         price_value = st.number_input("卖出价格", min_value=0.0, step=0.01, format="%.2f")
         shares = st.number_input("股数", min_value=0, step=1)
         fees = st.number_input("费用", min_value=0.0, step=0.01, format="%.2f")
@@ -2712,7 +2727,7 @@ def edit_trade_order_dialog(order_id: int) -> None:
             list(side_options.values()),
             index=list(side_options).index(order["side"]),
         )
-        trade_at = st.text_input("交易时间", value=str(order["trade_at"]))
+        trade_at = trade_datetime_input(f"edit_trade_order_{order_id}", "交易", order["trade_at"])
         price_value = st.number_input(
             "价格",
             min_value=0.0,
@@ -2996,7 +3011,7 @@ def execute_trade_ladder_level_dialog(level_id: int) -> None:
         st.warning("分档不存在，可能已经被删除。")
         return
     with st.form(f"execute_trade_ladder_level_form_{level_id}"):
-        trade_at = st.text_input("买入时间", value=db.today_iso())
+        trade_at = trade_datetime_input(f"execute_trade_ladder_level_{level_id}", "买入", now_minute_iso())
         price_value = st.number_input(
             "买入价格",
             min_value=0.0,
@@ -3053,7 +3068,7 @@ def sell_trade_ladder_level_dialog(level_id: int) -> None:
 
     default_price = float(idea["current_price"] or level["target_price"]) if idea else float(level["target_price"])
     with st.form(f"sell_trade_ladder_level_form_{level_id}"):
-        trade_at = st.text_input("卖出时间", value=db.today_iso())
+        trade_at = trade_datetime_input(f"sell_trade_ladder_level_{level_id}", "卖出", now_minute_iso())
         price_value = st.number_input(
             "卖出价格",
             min_value=0.0,
