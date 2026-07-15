@@ -1117,6 +1117,15 @@ def recommendation_time_cell(value: object) -> str:
     return html.escape(text)
 
 
+def datetime_display_text(value: object) -> str:
+    text = "" if value is None or pd.isna(value) else str(value).strip()
+    if not text:
+        return ""
+    if len(text) == 10 and text[4] == "-" and text[7] == "-":
+        return f"{text} 00:00"
+    return text
+
+
 def refresh_trade_idea_price(idea_id: int) -> market_data.Quote:
     idea = trade_services.get_idea(idea_id)
     if idea is None:
@@ -2816,7 +2825,7 @@ def render_trade_order_table(trade_rows: list[dict]) -> None:
         )
         cells = [
             side_text,
-            trade["trade_at"],
+            datetime_display_text(trade["trade_at"]),
             price(trade["price"]),
             int(trade["shares"]),
             price(trade["fees"]),
