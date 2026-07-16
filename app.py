@@ -982,13 +982,23 @@ def render_recommendation_source_table(summary: pd.DataFrame) -> None:
     for row_index, row in summary.sort_values("总收益折算", ascending=False).reset_index(drop=True).iterrows():
         source_id = int(row["id"])
         total_return_pct = source_total_return_pct(row)
+        market = str(row["market"])
+        market_class = {
+            "美股": "market-us",
+            "A股": "market-cn",
+            "港股": "market-hk",
+            "加密": "market-crypto",
+        }.get(market, "market-default")
         cells = [
             row_index + 1,
             (
+                "<span class='recommendation-source-cell'>"
                 f"<a class='recommendation-link' title='打开项目详情' "
                 f"href='{recommendation_source_action_url('open', source_id)}' target='_self' rel='noreferrer'>"
-                f"{html.escape(str(row['name']))}/{html.escape(str(row['market']))}"
-                f"/{html.escape(str(row['币种']))}</a>"
+                f"{html.escape(str(row['name']))}</a>"
+                f"<span class='market-badge {market_class}'>{html.escape(market)}</span>"
+                f"<span class='market-currency'>{html.escape(str(row['币种']))}</span>"
+                "</span>"
             ),
             int(row["标的数量"]),
             f"{int(row['持仓数量'])}/{int(row['已清仓数量'])}",
@@ -1090,6 +1100,56 @@ def render_recommendation_source_table(summary: pd.DataFrame) -> None:
         }}
         .recommendation-link:hover {{
             text-decoration: underline;
+        }}
+        .recommendation-source-cell {{
+            display: inline-flex;
+            align-items: center;
+            gap: 0.35rem;
+            max-width: 100%;
+        }}
+        .market-badge {{
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            min-width: 2.2rem;
+            padding: 0.08rem 0.32rem;
+            border-radius: 0.2rem;
+            font-size: 0.78rem;
+            font-weight: 800;
+            line-height: 1.25;
+            border: 1px solid transparent;
+            flex: 0 0 auto;
+        }}
+        .market-us {{
+            color: #bfdbfe;
+            background: rgba(37, 99, 235, 0.24);
+            border-color: rgba(96, 165, 250, 0.45);
+        }}
+        .market-cn {{
+            color: #fecaca;
+            background: rgba(220, 38, 38, 0.22);
+            border-color: rgba(248, 113, 113, 0.45);
+        }}
+        .market-hk {{
+            color: #fde68a;
+            background: rgba(217, 119, 6, 0.22);
+            border-color: rgba(251, 191, 36, 0.45);
+        }}
+        .market-crypto {{
+            color: #c4b5fd;
+            background: rgba(124, 58, 237, 0.24);
+            border-color: rgba(167, 139, 250, 0.45);
+        }}
+        .market-default {{
+            color: #e5e7eb;
+            background: rgba(107, 114, 128, 0.24);
+            border-color: rgba(156, 163, 175, 0.45);
+        }}
+        .market-currency {{
+            color: #9ca3af;
+            font-size: 0.82rem;
+            font-weight: 700;
+            flex: 0 0 auto;
         }}
         </style>
         <table class="recommendation-table">
