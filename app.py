@@ -73,7 +73,27 @@ def money(value: float | None) -> str:
 def price(value: float | None) -> str:
     if value is None or pd.isna(value):
         return "-"
-    return f"{value:,.2f}"
+    numeric = float(value)
+    if 0 < abs(numeric) < 1:
+        return f"{numeric:,.8f}".rstrip("0").rstrip(".")
+    return f"{numeric:,.2f}"
+
+
+def price_number_input(
+    label: str,
+    value: float | None = None,
+    allow_extended_precision: bool = False,
+    min_value: float = 0.0,
+    key: str | None = None,
+) -> float:
+    return st.number_input(
+        label,
+        min_value=float(min_value),
+        value=float(value) if value is not None else 0.0,
+        step=0.00000001 if allow_extended_precision else 0.01,
+        format="%.8f" if allow_extended_precision else "%.2f",
+        key=key,
+    )
 
 
 def share_text(value: float | None) -> str:
@@ -796,6 +816,10 @@ def edit_recommendation_plan_dialog(recommendation_id: int) -> None:
     if recommendation is None:
         st.warning("标的不存在，可能已经被删除。")
         return
+    source = get_recommendation_source(int(recommendation["source_id"]))
+    allow_extended_precision = trade_services.is_fractional_market(
+        source["market"] if source is not None else None
+    )
     with st.form(f"edit_recommendation_plan_form_{recommendation_id}"):
         symbol = st.text_input("标的代码", value=str(recommendation["symbol"]))
         name = st.text_input("名称", value=str(recommendation["name"]))
@@ -803,27 +827,23 @@ def edit_recommendation_plan_dialog(recommendation_id: int) -> None:
             f"edit_recommendation_plan_{recommendation_id}",
             recommendation["recommended_at"],
         )
-        recommendation_price = st.number_input(
+        recommendation_price = price_number_input(
             "计划价",
-            min_value=0.0,
             value=(
                 float(recommendation["recommendation_price"])
                 if recommendation["recommendation_price"] is not None
                 else 0.0
             ),
-            step=0.01,
-            format="%.2f",
+            allow_extended_precision=allow_extended_precision,
         )
-        current_price = st.number_input(
+        current_price = price_number_input(
             "当前价",
-            min_value=0.0,
             value=(
                 float(recommendation["current_price"])
                 if recommendation["current_price"] is not None
                 else 0.0
             ),
-            step=0.01,
-            format="%.2f",
+            allow_extended_precision=allow_extended_precision,
         )
         submitted = st.form_submit_button("保存", type="primary")
         delete_submitted = st.form_submit_button("删除")
@@ -2733,7 +2753,7 @@ def buy_trade_dialog(idea_id: int, symbol: str) -> None:
     allow_fractional_shares = trade_services.is_fractional_shares_idea(idea_id)
     with st.form(f"buy_trade_form_{idea_id}"):
         trade_at = trade_datetime_input(f"buy_trade_{idea_id}", "买入", now_minute_iso())
-        price_value = st.number_input("买入价格", min_value=0.0, step=0.01, format="%.2f")
+        price_value = price_number_input("买入价格", allow_extended_precision=allow_fractional_shares)
         shares = share_number_input("股数", allow_fractional=allow_fractional_shares)
         fees = st.number_input("费用", min_value=0.0, step=0.01, format="%.2f")
         submitted = st.form_submit_button("保存", type="primary")
@@ -2751,7 +2771,7 @@ def sell_trade_dialog(idea_id: int, symbol: str) -> None:
     allow_fractional_shares = trade_services.is_fractional_shares_idea(idea_id)
     with st.form(f"sell_trade_form_{idea_id}"):
         trade_at = trade_datetime_input(f"sell_trade_{idea_id}", "卖出", now_minute_iso())
-        price_value = st.number_input("卖出价格", min_value=0.0, step=0.01, format="%.2f")
+        price_value = price_number_input("卖出价格", allow_extended_precision=allow_fractional_shares)
         shares = share_number_input("股数", allow_fractional=allow_fractional_shares)
         fees = st.number_input("费用", min_value=0.0, step=0.01, format="%.2f")
         submitted = st.form_submit_button("保存", type="primary")
@@ -2779,12 +2799,10 @@ def edit_trade_order_dialog(order_id: int) -> None:
             index=list(side_options).index(order["side"]),
         )
         trade_at = trade_datetime_input(f"edit_trade_order_{order_id}", "交易", order["trade_at"])
-        price_value = st.number_input(
+        price_value = price_number_input(
             "价格",
-            min_value=0.0,
             value=float(order["price"]),
-            step=0.01,
-            format="%.2f",
+            allow_extended_precision=allow_fractional_shares,
         )
         shares = share_number_input(
             "股数",
@@ -2960,12 +2978,10 @@ def trade_ladder_plan_dialog(idea_id: int) -> None:
     level_count_default = (
         len(trade_services.ladder_status_rows(idea_id)) if existing is not None else 1
     )
-    anchor_price = st.number_input(
+    anchor_price = price_number_input(
         "首档价格",
-        min_value=0.0,
         value=anchor_default,
-        step=0.01,
-        format="%.2f",
+        allow_extended_precision=allow_fractional_shares,
         key=f"trade_ladder_anchor_{idea_id}",
     )
     first_shares = share_number_input(
@@ -3029,7 +3045,10 @@ def trade_ladder_plan_dialog(idea_id: int) -> None:
             width="stretch",
             hide_index=True,
             column_config={
-                "目标价": st.column_config.NumberColumn("目标价", format="%.2f"),
+                "目标价": st.column_config.NumberColumn(
+                    "目标价",
+                    format="%.8f" if allow_fractional_shares else "%.2f",
+                ),
                 "金额": st.column_config.NumberColumn("金额", format="%.2f"),
             },
         )
@@ -3073,12 +3092,10 @@ def execute_trade_ladder_level_dialog(level_id: int) -> None:
     )
     with st.form(f"execute_trade_ladder_level_form_{level_id}"):
         trade_at = trade_datetime_input(f"execute_trade_ladder_level_{level_id}", "买入", now_minute_iso())
-        price_value = st.number_input(
+        price_value = price_number_input(
             "买入价格",
-            min_value=0.0,
             value=float(level["target_price"]),
-            step=0.01,
-            format="%.2f",
+            allow_extended_precision=allow_fractional_shares,
         )
         shares = share_number_input(
             "股数",
@@ -3131,12 +3148,10 @@ def sell_trade_ladder_level_dialog(level_id: int) -> None:
     default_price = float(idea["current_price"] or level["target_price"]) if idea else float(level["target_price"])
     with st.form(f"sell_trade_ladder_level_form_{level_id}"):
         trade_at = trade_datetime_input(f"sell_trade_ladder_level_{level_id}", "卖出", now_minute_iso())
-        price_value = st.number_input(
+        price_value = price_number_input(
             "卖出价格",
-            min_value=0.0,
             value=default_price,
-            step=0.01,
-            format="%.2f",
+            allow_extended_precision=allow_fractional_shares,
         )
         shares = share_number_input(
             "股数",
@@ -3303,6 +3318,7 @@ def render_trade_ladder_table(idea_id: int) -> None:
 
 @st.dialog("编辑标的")
 def edit_trade_plan_dialog(row: pd.Series) -> None:
+    allow_extended_precision = trade_services.is_fractional_shares_idea(int(row["id"]))
     with st.form(f"edit_trade_plan_form_{int(row['id'])}"):
         symbol = st.text_input("标的代码", value=str(row["标的"]))
         name = st.text_input("名称", value=str(row["名称"]))
@@ -3310,19 +3326,15 @@ def edit_trade_plan_dialog(row: pd.Series) -> None:
             f"edit_trade_plan_{int(row['id'])}",
             row["提出时间"],
         )
-        plan_price = st.number_input(
+        plan_price = price_number_input(
             "计划价",
-            min_value=0.0,
             value=float(row["计划价"]) if pd.notna(row["计划价"]) else 0.0,
-            step=0.01,
-            format="%.2f",
+            allow_extended_precision=allow_extended_precision,
         )
-        current_price = st.number_input(
+        current_price = price_number_input(
             "当前价",
-            min_value=0.0,
             value=float(row["当前价"]) if pd.notna(row["当前价"]) else 0.0,
-            step=0.01,
-            format="%.2f",
+            allow_extended_precision=allow_extended_precision,
         )
         submitted = st.form_submit_button("保存", type="primary")
     if submitted:

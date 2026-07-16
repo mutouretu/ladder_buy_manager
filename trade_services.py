@@ -280,6 +280,7 @@ def generate_ladder_levels(
     levels = []
     target_price = float(anchor_price)
     target_amount = float(anchor_price) * float(first_shares)
+    target_price_precision = 8 if allow_fractional_shares else 4
     for index in range(1, int(level_count) + 1):
         if index == 1:
             shares = float(first_shares)
@@ -291,7 +292,7 @@ def generate_ladder_levels(
         levels.append(
             {
                 "level_index": index,
-                "target_price": round(target_price, 4),
+                "target_price": round(target_price, target_price_precision),
                 "planned_shares": shares if allow_fractional_shares else int(shares),
                 "planned_amount": round(amount, 2),
             }
