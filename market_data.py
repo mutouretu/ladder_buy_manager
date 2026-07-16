@@ -22,11 +22,34 @@ class Quote:
     provider: str
 
 
-def normalize_symbol(symbol: str) -> str:
+def normalize_symbol(symbol: str, market: str | None = None) -> str:
     cleaned = symbol.strip().upper()
     if not cleaned:
         raise MarketDataError("标的代码不能为空。")
+    if (market or "").strip() == "加密":
+        return normalize_crypto_symbol(cleaned)
     return cleaned
+
+
+def normalize_crypto_symbol(symbol: str) -> str:
+    cleaned = symbol.replace(" ", "").upper()
+    if "-" in cleaned:
+        base, quote_symbol = cleaned.split("-", 1)
+        return f"{base}-{crypto_quote_symbol(quote_symbol)}"
+    if "/" in cleaned:
+        base, quote_symbol = cleaned.split("/", 1)
+        return f"{base}-{crypto_quote_symbol(quote_symbol)}"
+    for quote_symbol in ("USDT", "USDC", "USD"):
+        if cleaned.endswith(quote_symbol) and len(cleaned) > len(quote_symbol):
+            return f"{cleaned[: -len(quote_symbol)]}-USD"
+    return f"{cleaned}-USD"
+
+
+def crypto_quote_symbol(symbol: str) -> str:
+    cleaned = symbol.strip().upper()
+    if cleaned in {"USDT", "USDC", "USD"}:
+        return "USD"
+    return cleaned or "USD"
 
 
 def date_from_timestamp(timestamp: int | float | None, gmtoffset: int = 0) -> str:
@@ -51,8 +74,8 @@ def latest_close(result: dict) -> tuple[float, int | float | None]:
     raise MarketDataError("行情接口没有可用收盘价。")
 
 
-def fetch_latest_price(symbol: str, timeout: int = 10) -> Quote:
-    normalized_symbol = normalize_symbol(symbol)
+def fetch_latest_price(symbol: str, timeout: int = 10, market: str | None = None) -> Quote:
+    normalized_symbol = normalize_symbol(symbol, market=market)
     query = urlencode({"range": "5d", "interval": "1d"})
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{quote(normalized_symbol)}?{query}"
     request = Request(url, headers={"User-Agent": "Mozilla/5.0"})

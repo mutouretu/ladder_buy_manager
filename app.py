@@ -1167,7 +1167,9 @@ def refresh_trade_idea_price(idea_id: int) -> market_data.Quote:
     idea = trade_services.get_idea(idea_id)
     if idea is None:
         raise ValueError("标的不存在。")
-    quote = market_data.fetch_latest_price(idea["symbol"])
+    source = get_recommendation_source(int(idea["source_id"]))
+    market = source["market"] if source is not None else None
+    quote = market_data.fetch_latest_price(idea["symbol"], market=market)
     trade_db.update_idea_current_price(idea_id, quote.price)
     return quote
 
@@ -1676,7 +1678,7 @@ def refresh_instrument_price_local(instrument_id: int) -> market_data.Quote:
     if instrument is None:
         raise ValueError("标的不存在。")
 
-    quote = market_data.fetch_latest_price(instrument["symbol"])
+    quote = market_data.fetch_latest_price(instrument["symbol"], market=instrument["category"])
     with db.get_connection() as conn:
         conn.execute(
             """
@@ -3429,8 +3431,7 @@ def stock_operation_page() -> None:
     action_cols = st.columns([0.45, 0.55, 0.55, 5])
     if action_cols[0].button("↻", help="刷新价格", width="stretch"):
         try:
-            quote = market_data.fetch_latest_price(str(row["标的"]))
-            trade_db.update_idea_current_price(int(row["id"]), quote.price)
+            quote = refresh_trade_idea_price(int(row["id"]))
             st.toast(f"{quote.symbol} 已更新：{price(quote.price)}")
             rerun()
         except Exception as exc:
