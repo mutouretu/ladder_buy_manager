@@ -48,7 +48,7 @@ def init_trade_schema() -> None:
                 side TEXT NOT NULL CHECK (side IN ('BUY', 'SELL')),
                 trade_at TEXT NOT NULL,
                 price REAL NOT NULL,
-                shares INTEGER NOT NULL,
+                shares REAL NOT NULL,
                 fees REAL NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
@@ -63,7 +63,7 @@ def init_trade_schema() -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 idea_id INTEGER NOT NULL UNIQUE,
                 anchor_price REAL NOT NULL,
-                first_shares INTEGER NOT NULL,
+                first_shares REAL NOT NULL,
                 trigger_pct REAL NOT NULL,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
@@ -78,7 +78,7 @@ def init_trade_schema() -> None:
                 plan_id INTEGER NOT NULL,
                 level_index INTEGER NOT NULL,
                 target_price REAL NOT NULL,
-                planned_shares INTEGER NOT NULL,
+                planned_shares REAL NOT NULL,
                 planned_amount REAL NOT NULL,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
@@ -100,7 +100,7 @@ def create_trade_orders_table(conn: sqlite3.Connection) -> None:
             side TEXT NOT NULL CHECK (side IN ('BUY', 'SELL')),
             trade_at TEXT NOT NULL,
             price REAL NOT NULL,
-            shares INTEGER NOT NULL,
+            shares REAL NOT NULL,
             fees REAL NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
@@ -153,7 +153,51 @@ def ensure_trade_schema(conn: sqlite3.Connection) -> None:
             )
             conn.execute("DROP TABLE trade_ideas_old")
             conn.execute("PRAGMA foreign_keys = ON")
+    ensure_trade_ladder_schema(conn)
     ensure_trade_orders_schema(conn)
+
+
+def column_type(columns: list[sqlite3.Row], name: str) -> str:
+    for column in columns:
+        if column["name"] == name:
+            return str(column["type"] or "").upper()
+    return ""
+
+
+def create_trade_ladder_plans_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE trade_ladder_plans (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            idea_id INTEGER NOT NULL UNIQUE,
+            anchor_price REAL NOT NULL,
+            first_shares REAL NOT NULL,
+            trigger_pct REAL NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (idea_id) REFERENCES trade_ideas(id) ON DELETE CASCADE
+        )
+        """
+    )
+
+
+def create_trade_ladder_levels_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE trade_ladder_levels (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            plan_id INTEGER NOT NULL,
+            level_index INTEGER NOT NULL,
+            target_price REAL NOT NULL,
+            planned_shares REAL NOT NULL,
+            planned_amount REAL NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (plan_id) REFERENCES trade_ladder_plans(id) ON DELETE CASCADE,
+            UNIQUE (plan_id, level_index)
+        )
+        """
+    )
 
 
 def ensure_trade_orders_schema(conn: sqlite3.Connection) -> None:
@@ -166,6 +210,7 @@ def ensure_trade_orders_schema(conn: sqlite3.Connection) -> None:
     level_foreign_keys = [row for row in foreign_keys if row["from"] == "ladder_level_id"]
     if (
         "ladder_level_id" in order_column_names
+        and column_type(order_columns, "shares") == "REAL"
         and idea_foreign_keys
         and all(row["table"] == "trade_ideas" for row in idea_foreign_keys)
         and level_foreign_keys
@@ -205,6 +250,49 @@ def ensure_trade_orders_schema(conn: sqlite3.Connection) -> None:
         )
     conn.execute("DROP TABLE trade_orders_rebuild_old")
     conn.execute("PRAGMA foreign_keys = ON")
+
+
+def ensure_trade_ladder_schema(conn: sqlite3.Connection) -> None:
+    plan_columns = conn.execute("PRAGMA table_info(trade_ladder_plans)").fetchall()
+    if plan_columns and column_type(plan_columns, "first_shares") != "REAL":
+        conn.execute("PRAGMA foreign_keys = OFF")
+        conn.execute("DROP TABLE IF EXISTS trade_ladder_plans_rebuild_old")
+        conn.execute("ALTER TABLE trade_ladder_plans RENAME TO trade_ladder_plans_rebuild_old")
+        create_trade_ladder_plans_table(conn)
+        conn.execute(
+            """
+            INSERT INTO trade_ladder_plans (
+                id, idea_id, anchor_price, first_shares, trigger_pct, created_at, updated_at
+            )
+            SELECT
+                id, idea_id, anchor_price, CAST(first_shares AS REAL),
+                trigger_pct, created_at, updated_at
+            FROM trade_ladder_plans_rebuild_old
+            """
+        )
+        conn.execute("DROP TABLE trade_ladder_plans_rebuild_old")
+        conn.execute("PRAGMA foreign_keys = ON")
+
+    level_columns = conn.execute("PRAGMA table_info(trade_ladder_levels)").fetchall()
+    if level_columns and column_type(level_columns, "planned_shares") != "REAL":
+        conn.execute("PRAGMA foreign_keys = OFF")
+        conn.execute("DROP TABLE IF EXISTS trade_ladder_levels_rebuild_old")
+        conn.execute("ALTER TABLE trade_ladder_levels RENAME TO trade_ladder_levels_rebuild_old")
+        create_trade_ladder_levels_table(conn)
+        conn.execute(
+            """
+            INSERT INTO trade_ladder_levels (
+                id, plan_id, level_index, target_price, planned_shares,
+                planned_amount, created_at, updated_at
+            )
+            SELECT
+                id, plan_id, level_index, target_price, CAST(planned_shares AS REAL),
+                planned_amount, created_at, updated_at
+            FROM trade_ladder_levels_rebuild_old
+            """
+        )
+        conn.execute("DROP TABLE trade_ladder_levels_rebuild_old")
+        conn.execute("PRAGMA foreign_keys = ON")
 
 
 def fetch_all(query: str, params: tuple[Any, ...] = ()) -> list[sqlite3.Row]:
@@ -460,7 +548,7 @@ def create_order(
     side: str,
     trade_at: str,
     price: float,
-    shares: int,
+    shares: float,
     fees: float = 0.0,
     ladder_level_id: int | None = None,
 ) -> int:
@@ -479,7 +567,7 @@ def create_order(
                 side.strip().upper(),
                 trade_at.strip(),
                 float(price),
-                int(shares),
+                float(shares),
                 float(fees),
                 now,
                 now,
@@ -493,7 +581,7 @@ def update_order(
     side: str,
     trade_at: str,
     price: float,
-    shares: int,
+    shares: float,
     fees: float = 0.0,
     ladder_level_id: int | None = None,
 ) -> None:
@@ -515,7 +603,7 @@ def update_order(
                 int(ladder_level_id) if ladder_level_id is not None else None,
                 trade_at.strip(),
                 float(price),
-                int(shares),
+                float(shares),
                 float(fees),
                 db.today_iso(),
                 int(order_id),
@@ -617,7 +705,7 @@ def list_ladder_levels(plan_id: int) -> list[sqlite3.Row]:
 def replace_ladder_plan(
     idea_id: int,
     anchor_price: float,
-    first_shares: int,
+    first_shares: float,
     trigger_pct: float,
     levels: list[dict],
 ) -> int:
@@ -635,7 +723,7 @@ def replace_ladder_plan(
                 )
                 VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (int(idea_id), float(anchor_price), int(first_shares), float(trigger_pct), now, now),
+                (int(idea_id), float(anchor_price), float(first_shares), float(trigger_pct), now, now),
             )
             plan_id = int(cursor.lastrowid)
         else:
@@ -649,7 +737,7 @@ def replace_ladder_plan(
                     updated_at = ?
                 WHERE id = ?
                 """,
-                (float(anchor_price), int(first_shares), float(trigger_pct), now, plan_id),
+                (float(anchor_price), float(first_shares), float(trigger_pct), now, plan_id),
             )
 
         existing_levels = {
@@ -678,7 +766,7 @@ def replace_ladder_plan(
                     """,
                     (
                         float(level["target_price"]),
-                        int(level["planned_shares"]),
+                        float(level["planned_shares"]),
                         float(level["planned_amount"]),
                         now,
                         int(existing_levels[level_index]["id"]),
@@ -697,7 +785,7 @@ def replace_ladder_plan(
                         plan_id,
                         level_index,
                         float(level["target_price"]),
-                        int(level["planned_shares"]),
+                        float(level["planned_shares"]),
                         float(level["planned_amount"]),
                         now,
                         now,

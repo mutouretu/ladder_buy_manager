@@ -76,6 +76,43 @@ def price(value: float | None) -> str:
     return f"{value:,.2f}"
 
 
+def share_text(value: float | None) -> str:
+    if value is None or pd.isna(value):
+        return "-"
+    numeric = float(value)
+    if abs(numeric - round(numeric)) < 0.00000001:
+        return f"{int(round(numeric))}"
+    return f"{numeric:.8f}".rstrip("0").rstrip(".")
+
+
+def share_number_input(
+    label: str,
+    value: float | None = None,
+    allow_fractional: bool = False,
+    min_value: float = 0,
+    max_value: float | None = None,
+    key: str | None = None,
+) -> float | None:
+    if allow_fractional:
+        return st.number_input(
+            label,
+            min_value=float(min_value),
+            max_value=float(max_value) if max_value is not None else None,
+            value=float(value) if value is not None else None,
+            step=0.00000001,
+            format="%.8f",
+            key=key,
+        )
+    return st.number_input(
+        label,
+        min_value=int(min_value),
+        max_value=int(max_value) if max_value is not None else None,
+        value=int(value) if value is not None else None,
+        step=1,
+        key=key,
+    )
+
+
 def overview_row_style(needs_action: pd.Series):
     def style(row: pd.Series) -> list[str]:
         if bool(needs_action.loc[row.name]):
@@ -1211,7 +1248,7 @@ def render_recommendation_detail_table(frame: pd.DataFrame, source_id: int | Non
             (recommendation_time_cell(row["提出时间"]), False),
             (recommendation_plan_current_pair(row["计划价"], row["当前价"]), True),
             (recommendation_price_pair(row["买入价"], row["卖出价"]), False),
-            (f"{int(row['持仓股数'])}/{int(row['卖出股数'])}股", False),
+            (f"{share_text(row['持仓股数'])}/{share_text(row['卖出股数'])}股", False),
             (f"{colored_money_text(row['浮动盈亏'])}/{colored_money_text(row['已实现盈亏'])}", True),
             (invested_return_text(row["投入金额"], row["总收益率"]), True),
             (action, True),
@@ -2691,15 +2728,16 @@ def recommendation_detail_page() -> None:
 
 @st.dialog("买入")
 def buy_trade_dialog(idea_id: int, symbol: str) -> None:
+    allow_fractional_shares = trade_services.is_fractional_shares_idea(idea_id)
     with st.form(f"buy_trade_form_{idea_id}"):
         trade_at = trade_datetime_input(f"buy_trade_{idea_id}", "买入", now_minute_iso())
         price_value = st.number_input("买入价格", min_value=0.0, step=0.01, format="%.2f")
-        shares = st.number_input("股数", min_value=0, step=1)
+        shares = share_number_input("股数", allow_fractional=allow_fractional_shares)
         fees = st.number_input("费用", min_value=0.0, step=0.01, format="%.2f")
         submitted = st.form_submit_button("保存", type="primary")
     if submitted:
         try:
-            trade_services.create_order(idea_id, "BUY", trade_at, price_value, int(shares), fees)
+            trade_services.create_order(idea_id, "BUY", trade_at, price_value, float(shares), fees)
             st.success(f"{symbol} 买入记录已保存。")
             rerun()
         except ValueError as exc:
@@ -2708,15 +2746,16 @@ def buy_trade_dialog(idea_id: int, symbol: str) -> None:
 
 @st.dialog("卖出")
 def sell_trade_dialog(idea_id: int, symbol: str) -> None:
+    allow_fractional_shares = trade_services.is_fractional_shares_idea(idea_id)
     with st.form(f"sell_trade_form_{idea_id}"):
         trade_at = trade_datetime_input(f"sell_trade_{idea_id}", "卖出", now_minute_iso())
         price_value = st.number_input("卖出价格", min_value=0.0, step=0.01, format="%.2f")
-        shares = st.number_input("股数", min_value=0, step=1)
+        shares = share_number_input("股数", allow_fractional=allow_fractional_shares)
         fees = st.number_input("费用", min_value=0.0, step=0.01, format="%.2f")
         submitted = st.form_submit_button("保存", type="primary")
     if submitted:
         try:
-            trade_services.create_order(idea_id, "SELL", trade_at, price_value, int(shares), fees)
+            trade_services.create_order(idea_id, "SELL", trade_at, price_value, float(shares), fees)
             st.success(f"{symbol} 卖出记录已保存。")
             rerun()
         except ValueError as exc:
@@ -2729,6 +2768,7 @@ def edit_trade_order_dialog(order_id: int) -> None:
     if order is None:
         st.warning("交易记录不存在，可能已经被删除。")
         return
+    allow_fractional_shares = trade_services.is_fractional_shares_idea(int(order["idea_id"]))
     side_options = {"BUY": "买入", "SELL": "卖出"}
     with st.form(f"edit_trade_order_form_{order_id}"):
         side_label = st.selectbox(
@@ -2744,7 +2784,11 @@ def edit_trade_order_dialog(order_id: int) -> None:
             step=0.01,
             format="%.2f",
         )
-        shares = st.number_input("股数", min_value=0, value=int(order["shares"]), step=1)
+        shares = share_number_input(
+            "股数",
+            value=float(order["shares"]),
+            allow_fractional=allow_fractional_shares,
+        )
         fees = st.number_input(
             "费用",
             min_value=0.0,
@@ -2756,7 +2800,7 @@ def edit_trade_order_dialog(order_id: int) -> None:
     if submitted:
         try:
             side = "BUY" if side_label == "买入" else "SELL"
-            trade_services.update_order(order_id, side, trade_at, price_value, int(shares), fees)
+            trade_services.update_order(order_id, side, trade_at, price_value, float(shares), fees)
             st.success("交易记录已保存。")
             rerun()
         except ValueError as exc:
@@ -2827,7 +2871,7 @@ def render_trade_order_table(trade_rows: list[dict]) -> None:
             side_text,
             datetime_display_text(trade["trade_at"]),
             price(trade["price"]),
-            int(trade["shares"]),
+            share_text(trade["shares"]),
             price(trade["fees"]),
             action,
         ]
@@ -2902,13 +2946,14 @@ def trade_ladder_plan_dialog(idea_id: int) -> None:
     if idea is None:
         st.warning("标的不存在，可能已经被删除。")
         return
+    allow_fractional_shares = trade_services.is_fractional_shares_idea(idea_id)
     existing = trade_services.get_ladder_plan_for_idea(idea_id)
     anchor_default = (
         float(existing["anchor_price"])
         if existing is not None
         else float(idea["plan_price"] or idea["current_price"] or 0)
     )
-    first_shares_default = int(existing["first_shares"]) if existing is not None else None
+    first_shares_default = float(existing["first_shares"]) if existing is not None else None
     trigger_default = float(existing["trigger_pct"]) * 100 if existing is not None else None
     level_count_default = (
         len(trade_services.ladder_status_rows(idea_id)) if existing is not None else 1
@@ -2921,11 +2966,11 @@ def trade_ladder_plan_dialog(idea_id: int) -> None:
         format="%.2f",
         key=f"trade_ladder_anchor_{idea_id}",
     )
-    first_shares = st.number_input(
+    first_shares = share_number_input(
         "首档股数",
-        min_value=1,
         value=first_shares_default,
-        step=1,
+        allow_fractional=allow_fractional_shares,
+        min_value=0.00000001 if allow_fractional_shares else 1,
         key=f"trade_ladder_first_shares_{idea_id}",
     )
     trigger_pct_percent = st.number_input(
@@ -2955,9 +3000,10 @@ def trade_ladder_plan_dialog(idea_id: int) -> None:
             raise ValueError("触发比例不能为空。")
         preview_levels = trade_services.generate_ladder_levels(
             anchor_price=float(anchor_price),
-            first_shares=int(first_shares),
+            first_shares=float(first_shares),
             trigger_pct=float(trigger_pct_percent) / 100,
             level_count=int(level_count),
+            allow_fractional_shares=allow_fractional_shares,
         )
     except ValueError as exc:
         preview_error = str(exc)
@@ -2970,7 +3016,7 @@ def trade_ladder_plan_dialog(idea_id: int) -> None:
                 {
                     "LV": f"LV{int(level['level_index'])}",
                     "目标价": float(level["target_price"]),
-                    "股数": int(level["planned_shares"]),
+                    "股数": share_text(level["planned_shares"]),
                     "金额": float(level["planned_amount"]),
                 }
                 for level in preview_levels
@@ -2991,7 +3037,7 @@ def trade_ladder_plan_dialog(idea_id: int) -> None:
             trade_services.create_or_replace_ladder_plan(
                 idea_id=idea_id,
                 anchor_price=float(anchor_price),
-                first_shares=int(first_shares),
+                first_shares=float(first_shares),
                 trigger_pct=float(trigger_pct_percent) / 100,
                 level_count=int(level_count),
             )
@@ -3019,6 +3065,10 @@ def execute_trade_ladder_level_dialog(level_id: int) -> None:
     if level is None:
         st.warning("分档不存在，可能已经被删除。")
         return
+    plan = trade_db.get_ladder_plan(int(level["plan_id"]))
+    allow_fractional_shares = (
+        trade_services.is_fractional_shares_idea(int(plan["idea_id"])) if plan is not None else False
+    )
     with st.form(f"execute_trade_ladder_level_form_{level_id}"):
         trade_at = trade_datetime_input(f"execute_trade_ladder_level_{level_id}", "买入", now_minute_iso())
         price_value = st.number_input(
@@ -3028,11 +3078,11 @@ def execute_trade_ladder_level_dialog(level_id: int) -> None:
             step=0.01,
             format="%.2f",
         )
-        shares = st.number_input(
+        shares = share_number_input(
             "股数",
-            min_value=1,
-            value=int(level["planned_shares"]),
-            step=1,
+            min_value=0.00000001 if allow_fractional_shares else 1,
+            value=float(level["planned_shares"]),
+            allow_fractional=allow_fractional_shares,
         )
         fees = st.number_input("费用", min_value=0.0, value=0.0, step=0.01, format="%.2f")
         submitted = st.form_submit_button("保存", type="primary")
@@ -3042,7 +3092,7 @@ def execute_trade_ladder_level_dialog(level_id: int) -> None:
                 level_id=level_id,
                 trade_at=trade_at,
                 price=price_value,
-                shares=int(shares),
+                shares=float(shares),
                 fees=fees,
             )
             st.success("分档买入记录已保存。")
@@ -3070,11 +3120,12 @@ def sell_trade_ladder_level_dialog(level_id: int) -> None:
         ),
         None,
     )
-    open_shares = int(ladder_row["open_shares"]) if ladder_row else 0
+    open_shares = float(ladder_row["open_shares"]) if ladder_row else 0
     if open_shares <= 0:
         st.warning("该档位没有可卖出的持仓。")
         return
 
+    allow_fractional_shares = trade_services.is_fractional_shares_idea(int(plan["idea_id"]))
     default_price = float(idea["current_price"] or level["target_price"]) if idea else float(level["target_price"])
     with st.form(f"sell_trade_ladder_level_form_{level_id}"):
         trade_at = trade_datetime_input(f"sell_trade_ladder_level_{level_id}", "卖出", now_minute_iso())
@@ -3085,12 +3136,12 @@ def sell_trade_ladder_level_dialog(level_id: int) -> None:
             step=0.01,
             format="%.2f",
         )
-        shares = st.number_input(
+        shares = share_number_input(
             "股数",
-            min_value=1,
+            min_value=0.00000001 if allow_fractional_shares else 1,
             max_value=open_shares,
             value=open_shares,
-            step=1,
+            allow_fractional=allow_fractional_shares,
         )
         fees = st.number_input("费用", min_value=0.0, value=0.0, step=0.01, format="%.2f")
         submitted = st.form_submit_button("保存", type="primary")
@@ -3100,7 +3151,7 @@ def sell_trade_ladder_level_dialog(level_id: int) -> None:
                 level_id=level_id,
                 trade_at=trade_at,
                 price=price_value,
-                shares=int(shares),
+                shares=float(shares),
                 fees=fees,
             )
             st.success("分档卖出记录已保存。")
@@ -3165,7 +3216,7 @@ def render_trade_ladder_table(idea_id: int) -> None:
         cells = [
             f"LV{int(row['level_index'])}",
             price(row["target_price"]),
-            f"{int(row['planned_shares'])}股/{price(row['planned_amount'])}",
+            f"{share_text(row['planned_shares'])}股/{price(row['planned_amount'])}",
             row["状态"],
             action,
         ]
@@ -3350,7 +3401,12 @@ def stock_operation_page() -> None:
             recommendation_price_pair(row["买入价"], row["卖出价"]),
             "inherit",
         )
-        render_colored_metric(metric_cols[3], "持仓/卖出", f"{int(row['持仓股数'])}/{int(row['卖出股数'])}股", "inherit")
+        render_colored_metric(
+            metric_cols[3],
+            "持仓/卖出",
+            f"{share_text(row['持仓股数'])}/{share_text(row['卖出股数'])}股",
+            "inherit",
+        )
         render_colored_metric(metric_cols[4], "投入", money(row["投入金额"]), "inherit")
         render_colored_metric(
             metric_cols[5],
@@ -3397,7 +3453,7 @@ def stock_operation_page() -> None:
         st.caption(
             (
                 f"首档 {price(ladder_plan['anchor_price'])} / "
-                f"{int(ladder_plan['first_shares'])}股 / "
+                f"{share_text(ladder_plan['first_shares'])}股 / "
                 f"间隔 {float(ladder_plan['trigger_pct']) * 100:.2f}%"
             )
         )

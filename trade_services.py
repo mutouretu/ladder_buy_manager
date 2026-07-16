@@ -76,7 +76,19 @@ def display_idea_at(idea_at: str | None) -> str:
     return cleaned
 
 
-def normalize_status(status: str | None, position_shares: int, has_trade: bool) -> str:
+def is_fractional_market(market: str | None) -> bool:
+    return (market or "").strip() == "加密"
+
+
+def is_fractional_shares_idea(idea_id: int) -> bool:
+    idea = trade_db.get_idea(idea_id)
+    if idea is None:
+        return False
+    source = trade_db.get_source(int(idea["source_id"]))
+    return is_fractional_market(source["market"] if source is not None else None)
+
+
+def normalize_status(status: str | None, position_shares: float, has_trade: bool) -> str:
     if status == "completed":
         return "已完成"
     if status == "closed":
@@ -184,7 +196,7 @@ def create_order(
     side: str,
     trade_at: str,
     price: float,
-    shares: int,
+    shares: float,
     fees: float = 0.0,
     ladder_level_id: int | None = None,
 ) -> int:
@@ -193,7 +205,7 @@ def create_order(
         raise ValueError("交易方向必须是 BUY 或 SELL。")
     if float(price) <= 0:
         raise ValueError("交易价格必须大于 0。")
-    if int(shares) <= 0:
+    if float(shares) <= 0:
         raise ValueError("股数必须大于 0。")
     order_id = trade_db.create_order(
         idea_id, normalized_side, trade_at, price, shares, fees, ladder_level_id
@@ -211,7 +223,7 @@ def update_order(
     side: str,
     trade_at: str,
     price: float,
-    shares: int,
+    shares: float,
     fees: float = 0.0,
 ) -> None:
     existing = trade_db.get_order(order_id)
@@ -222,7 +234,7 @@ def update_order(
         raise ValueError("交易方向必须是 BUY 或 SELL。")
     if float(price) <= 0:
         raise ValueError("交易价格必须大于 0。")
-    if int(shares) <= 0:
+    if float(shares) <= 0:
         raise ValueError("股数必须大于 0。")
     trade_db.update_order(
         order_id,
@@ -249,14 +261,17 @@ def delete_order(order_id: int) -> None:
 
 def generate_ladder_levels(
     anchor_price: float,
-    first_shares: int,
+    first_shares: float,
     trigger_pct: float,
     level_count: int,
+    allow_fractional_shares: bool = False,
 ) -> list[dict]:
     if float(anchor_price) <= 0:
         raise ValueError("首档价格必须大于 0。")
-    if int(first_shares) <= 0:
+    if float(first_shares) <= 0:
         raise ValueError("首档股数必须大于 0。")
+    if not allow_fractional_shares and float(first_shares) != int(float(first_shares)):
+        raise ValueError("非加密市场的股数必须是整数。")
     if not 0 <= float(trigger_pct) < 1:
         raise ValueError("触发比例必须在 0 到 100% 之间。")
     if int(level_count) < 1:
@@ -264,18 +279,20 @@ def generate_ladder_levels(
 
     levels = []
     target_price = float(anchor_price)
-    target_amount = float(anchor_price) * int(first_shares)
+    target_amount = float(anchor_price) * float(first_shares)
     for index in range(1, int(level_count) + 1):
         if index == 1:
-            shares = int(first_shares)
+            shares = float(first_shares)
+        elif allow_fractional_shares:
+            shares = round(target_amount / target_price, 8)
         else:
-            shares = max(1, floor(target_amount / target_price + 0.5))
+            shares = float(max(1, floor(target_amount / target_price + 0.5)))
         amount = target_price * shares
         levels.append(
             {
                 "level_index": index,
                 "target_price": round(target_price, 4),
-                "planned_shares": shares,
+                "planned_shares": shares if allow_fractional_shares else int(shares),
                 "planned_amount": round(amount, 2),
             }
         )
@@ -287,13 +304,20 @@ def generate_ladder_levels(
 def create_or_replace_ladder_plan(
     idea_id: int,
     anchor_price: float,
-    first_shares: int,
+    first_shares: float,
     trigger_pct: float,
     level_count: int,
 ) -> int:
     if trade_db.get_idea(idea_id) is None:
         raise ValueError("标的不存在。")
-    levels = generate_ladder_levels(anchor_price, first_shares, trigger_pct, level_count)
+    allow_fractional_shares = is_fractional_shares_idea(idea_id)
+    levels = generate_ladder_levels(
+        anchor_price,
+        first_shares,
+        trigger_pct,
+        level_count,
+        allow_fractional_shares=allow_fractional_shares,
+    )
     plan_id = trade_db.replace_ladder_plan(
         idea_id=idea_id,
         anchor_price=anchor_price,
@@ -352,20 +376,22 @@ def ladder_status_rows(idea_id: int) -> list[dict]:
     if plan is None:
         return []
     orders = trade_db.list_orders(idea_id)
-    level_positions: dict[int, dict[str, int]] = {}
+    level_positions: dict[int, dict[str, float]] = {}
     for order in orders:
         if order["ladder_level_id"] is None:
             continue
         level_id = int(order["ladder_level_id"])
-        level_positions.setdefault(level_id, {"buy": 0, "sell": 0})
+        level_positions.setdefault(level_id, {"buy": 0.0, "sell": 0.0})
         if order["side"] == "BUY":
-            level_positions[level_id]["buy"] += int(order["shares"])
+            level_positions[level_id]["buy"] += float(order["shares"])
         elif order["side"] == "SELL":
-            level_positions[level_id]["sell"] += int(order["shares"])
+            level_positions[level_id]["sell"] += float(order["shares"])
     rows = []
     for level in trade_db.list_ladder_levels(int(plan["id"])):
-        position = level_positions.get(int(level["id"]), {"buy": 0, "sell": 0})
-        open_shares = max(0, position["buy"] - position["sell"])
+        position = level_positions.get(int(level["id"]), {"buy": 0.0, "sell": 0.0})
+        open_shares = max(0.0, position["buy"] - position["sell"])
+        if open_shares < 0.00000001:
+            open_shares = 0.0
         if position["buy"] > 0 and open_shares == 0:
             status = "sold"
             status_label = "已卖出"
@@ -403,7 +429,7 @@ def execute_ladder_level(
     level_id: int,
     trade_at: str,
     price: float | None = None,
-    shares: int | None = None,
+    shares: float | None = None,
     fees: float = 0.0,
 ) -> int:
     level = trade_db.get_ladder_level(level_id)
@@ -417,7 +443,7 @@ def execute_ladder_level(
         side="BUY",
         trade_at=trade_at,
         price=float(price) if price is not None else float(level["target_price"]),
-        shares=int(shares) if shares is not None else int(level["planned_shares"]),
+        shares=float(shares) if shares is not None else float(level["planned_shares"]),
         fees=fees,
         ladder_level_id=int(level_id),
     )
@@ -429,7 +455,7 @@ def sell_ladder_level(
     level_id: int,
     trade_at: str,
     price: float,
-    shares: int | None = None,
+    shares: float | None = None,
     fees: float = 0.0,
 ) -> int:
     level = trade_db.get_ladder_level(level_id)
@@ -442,12 +468,12 @@ def sell_ladder_level(
     row = next((item for item in rows if int(item["id"]) == int(level_id)), None)
     if row is None:
         raise ValueError("分档不存在。")
-    open_shares = int(row["open_shares"])
+    open_shares = float(row["open_shares"])
     if open_shares <= 0:
         raise ValueError("该档位没有可卖出的持仓。")
-    sell_shares = open_shares if shares is None else int(shares)
-    if sell_shares <= 0 or sell_shares > open_shares:
-        raise ValueError(f"卖出股数必须在 1 到 {open_shares} 之间。")
+    sell_shares = open_shares if shares is None else float(shares)
+    if sell_shares <= 0 or sell_shares - open_shares > 0.00000001:
+        raise ValueError(f"卖出股数必须在 0 到 {open_shares:g} 之间。")
     order_id = create_order(
         idea_id=int(plan["idea_id"]),
         side="SELL",
@@ -473,7 +499,7 @@ def restore_idea_from_archive(idea_id: int) -> None:
     if idea is None:
         return
     orders = trade_db.list_orders(idea_id)
-    buy_shares = sum(int(order["shares"]) for order in orders if order["side"] == "BUY")
+    buy_shares = sum(float(order["shares"]) for order in orders if order["side"] == "BUY")
     if not orders:
         next_status = "watching"
     elif buy_shares > 0:
@@ -487,7 +513,7 @@ def recover_idea_to_watchlist(idea_id: int) -> None:
     if trade_db.get_idea(idea_id) is None:
         return
     orders = trade_db.list_orders(idea_id)
-    buy_shares = sum(int(order["shares"]) for order in orders if order["side"] == "BUY")
+    buy_shares = sum(float(order["shares"]) for order in orders if order["side"] == "BUY")
     next_status = "holding" if buy_shares > 0 else "watching"
     trade_db.update_idea_status(idea_id, next_status)
 
@@ -504,15 +530,15 @@ def idea_rows() -> pd.DataFrame:
         if source is None:
             continue
         orders = orders_by_idea.get(int(idea["id"]), [])
-        buy_shares = sum(int(order["shares"]) for order in orders if order["side"] == "BUY")
-        sell_shares = sum(int(order["shares"]) for order in orders if order["side"] == "SELL")
+        buy_shares = sum(float(order["shares"]) for order in orders if order["side"] == "BUY")
+        sell_shares = sum(float(order["shares"]) for order in orders if order["side"] == "SELL")
         buy_amount = sum(
-            float(order["price"]) * int(order["shares"]) + float(order["fees"])
+            float(order["price"]) * float(order["shares"]) + float(order["fees"])
             for order in orders
             if order["side"] == "BUY"
         )
         sell_amount = sum(
-            float(order["price"]) * int(order["shares"]) - float(order["fees"])
+            float(order["price"]) * float(order["shares"]) - float(order["fees"])
             for order in orders
             if order["side"] == "SELL"
         )
