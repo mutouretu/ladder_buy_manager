@@ -26,8 +26,28 @@ def normalize_symbol(symbol: str, market: str | None = None) -> str:
     cleaned = symbol.strip().upper()
     if not cleaned:
         raise MarketDataError("标的代码不能为空。")
-    if (market or "").strip() == "加密":
+    market_name = (market or "").strip()
+    if market_name == "加密":
         return normalize_crypto_symbol(cleaned)
+    if market_name == "A股":
+        return normalize_china_symbol(cleaned)
+    return cleaned
+
+
+def normalize_china_symbol(symbol: str) -> str:
+    cleaned = symbol.replace(" ", "").upper()
+    if cleaned.endswith(".SH"):
+        return f"{cleaned[:-3]}.SS"
+    if cleaned.endswith(".SS") or cleaned.endswith(".SZ") or cleaned.endswith(".BJ"):
+        return cleaned
+    if "." in cleaned:
+        return cleaned
+    if cleaned.startswith(("6", "9")):
+        return f"{cleaned}.SS"
+    if cleaned.startswith(("0", "2", "3")):
+        return f"{cleaned}.SZ"
+    if cleaned.startswith(("4", "8")):
+        return f"{cleaned}.BJ"
     return cleaned
 
 
