@@ -3020,6 +3020,27 @@ def render_trade_order_table(trade_rows: list[dict]) -> None:
     )
 
 
+def update_trade_ladder_editor_amounts(editor_key: str, draft_key: str) -> None:
+    draft = st.session_state.get(draft_key)
+    editor_state = st.session_state.get(editor_key)
+    if not isinstance(draft, pd.DataFrame) or not isinstance(editor_state, dict):
+        return
+
+    updated = draft.copy()
+    for row_index, changes in editor_state.get("edited_rows", {}).items():
+        row_position = int(row_index)
+        if row_position not in updated.index:
+            continue
+        for column in ("目标价", "股数"):
+            if column in changes:
+                updated.at[row_position, column] = changes[column]
+
+    prices = pd.to_numeric(updated["目标价"], errors="coerce")
+    shares = pd.to_numeric(updated["股数"], errors="coerce")
+    updated["金额"] = (prices * shares).round(2)
+    st.session_state[draft_key] = updated
+
+
 @st.dialog("创建分档计划")
 def trade_ladder_plan_dialog(idea_id: int) -> None:
     idea = trade_services.get_idea(idea_id)
@@ -3115,6 +3136,10 @@ def trade_ladder_plan_dialog(idea_id: int) -> None:
                     "LV": int(level["level_index"]),
                     "目标价": float(level["target_price"]),
                     "股数": float(level["planned_shares"]),
+                    "金额": round(
+                        float(level["target_price"]) * float(level["planned_shares"]),
+                        2,
+                    ),
                 }
                 for level in preview_levels
             ]
@@ -3124,11 +3149,14 @@ def trade_ladder_plan_dialog(idea_id: int) -> None:
             f"{float(anchor_price):.8f}_{float(first_shares):.8f}_"
             f"{float(trigger_pct_percent):.4f}_{int(level_count)}"
         )
+        draft_key = f"{editor_key}_draft"
+        if draft_key not in st.session_state:
+            st.session_state[draft_key] = preview_frame
         edited_levels = st.data_editor(
-            preview_frame,
+            st.session_state[draft_key],
             width="stretch",
             hide_index=True,
-            disabled=["LV"],
+            disabled=["LV", "金额"],
             column_config={
                 "LV": st.column_config.NumberColumn("LV", min_value=1, step=1),
                 "目标价": st.column_config.NumberColumn(
@@ -3142,25 +3170,11 @@ def trade_ladder_plan_dialog(idea_id: int) -> None:
                     step=0.00000001 if allow_fractional_shares else 1,
                     format="%.8f" if allow_fractional_shares else "%d",
                 ),
-            },
-            key=editor_key,
-        )
-        edited_levels["金额"] = edited_levels["目标价"].astype(float) * edited_levels["股数"].astype(float)
-        st.dataframe(
-            edited_levels[["LV", "目标价", "股数", "金额"]],
-            width="stretch",
-            hide_index=True,
-            column_config={
-                "目标价": st.column_config.NumberColumn(
-                    "目标价",
-                    format="%.8f" if allow_fractional_shares else "%.2f",
-                ),
-                "股数": st.column_config.NumberColumn(
-                    "股数",
-                    format="%.8f" if allow_fractional_shares else "%d",
-                ),
                 "金额": st.column_config.NumberColumn("金额", format="%.2f"),
             },
+            key=editor_key,
+            on_change=update_trade_ladder_editor_amounts,
+            args=(editor_key, draft_key),
         )
     else:
         edited_levels = pd.DataFrame()
