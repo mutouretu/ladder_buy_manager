@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import datetime
-from math import floor
+from math import floor, isfinite
 
 import pandas as pd
 
@@ -325,6 +325,65 @@ def create_or_replace_ladder_plan(
         first_shares=first_shares,
         trigger_pct=trigger_pct,
         levels=levels,
+    )
+    sync_next_ladder_plan_price(idea_id)
+    return plan_id
+
+
+def save_ladder_plan(
+    idea_id: int,
+    anchor_price: float,
+    first_shares: float,
+    trigger_pct: float,
+    levels: list[dict],
+) -> int:
+    if trade_db.get_idea(idea_id) is None:
+        raise ValueError("标的不存在。")
+    if not isfinite(float(anchor_price)) or float(anchor_price) <= 0:
+        raise ValueError("首档价格必须大于 0。")
+    if not isfinite(float(first_shares)) or float(first_shares) <= 0:
+        raise ValueError("首档股数必须大于 0。")
+    if not isfinite(float(trigger_pct)) or not 0 <= float(trigger_pct) < 1:
+        raise ValueError("触发比例必须在 0 到 100% 之间。")
+
+    allow_fractional_shares = is_fractional_shares_idea(idea_id)
+    normalized_levels = []
+    seen_indexes = set()
+    for level in levels:
+        level_index = int(level["level_index"])
+        target_price = float(level["target_price"])
+        planned_shares = float(level["planned_shares"])
+        if level_index < 1:
+            raise ValueError("LV 序号必须大于 0。")
+        if level_index in seen_indexes:
+            raise ValueError("LV 序号不能重复。")
+        if not isfinite(target_price) or target_price <= 0:
+            raise ValueError(f"LV{level_index} 目标价必须大于 0。")
+        if not isfinite(planned_shares) or planned_shares <= 0:
+            raise ValueError(f"LV{level_index} 股数必须大于 0。")
+        if not allow_fractional_shares and planned_shares != int(planned_shares):
+            raise ValueError(f"LV{level_index} 非加密市场股数必须是整数。")
+        seen_indexes.add(level_index)
+        normalized_shares = planned_shares if allow_fractional_shares else int(planned_shares)
+        normalized_levels.append(
+            {
+                "level_index": level_index,
+                "target_price": target_price,
+                "planned_shares": normalized_shares,
+                "planned_amount": round(target_price * normalized_shares, 2),
+            }
+        )
+
+    if not normalized_levels:
+        raise ValueError("至少需要一个 LV。")
+
+    normalized_levels.sort(key=lambda item: item["level_index"])
+    plan_id = trade_db.replace_ladder_plan(
+        idea_id=idea_id,
+        anchor_price=anchor_price,
+        first_shares=first_shares,
+        trigger_pct=trigger_pct,
+        levels=normalized_levels,
     )
     sync_next_ladder_plan_price(idea_id)
     return plan_id

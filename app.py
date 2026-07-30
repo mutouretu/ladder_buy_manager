@@ -3076,13 +3076,33 @@ def trade_ladder_plan_dialog(idea_id: int) -> None:
             raise ValueError("首档股数不能为空。")
         if trigger_pct_percent is None:
             raise ValueError("触发比例不能为空。")
-        preview_levels = trade_services.generate_ladder_levels(
-            anchor_price=float(anchor_price),
-            first_shares=float(first_shares),
-            trigger_pct=float(trigger_pct_percent) / 100,
-            level_count=int(level_count),
-            allow_fractional_shares=allow_fractional_shares,
+        existing_level_count = len(trade_services.ladder_status_rows(idea_id)) if existing is not None else 0
+        use_existing_levels = (
+            existing is not None
+            and abs(float(anchor_price) - float(existing["anchor_price"])) < 0.00000001
+            and abs(float(first_shares) - float(existing["first_shares"])) < 0.00000001
+            and abs(float(trigger_pct_percent) / 100 - float(existing["trigger_pct"])) < 0.00000001
+            and int(level_count) == existing_level_count
         )
+        if use_existing_levels:
+            plan_levels = trade_db.list_ladder_levels(int(existing["id"]))
+            preview_levels = [
+                {
+                    "level_index": int(level["level_index"]),
+                    "target_price": float(level["target_price"]),
+                    "planned_shares": float(level["planned_shares"]),
+                    "planned_amount": float(level["planned_amount"]),
+                }
+                for level in plan_levels
+            ]
+        else:
+            preview_levels = trade_services.generate_ladder_levels(
+                anchor_price=float(anchor_price),
+                first_shares=float(first_shares),
+                trigger_pct=float(trigger_pct_percent) / 100,
+                level_count=int(level_count),
+                allow_fractional_shares=allow_fractional_shares,
+            )
     except ValueError as exc:
         preview_error = str(exc)
 
@@ -3092,16 +3112,42 @@ def trade_ladder_plan_dialog(idea_id: int) -> None:
         preview_frame = pd.DataFrame(
             [
                 {
-                    "LV": f"LV{int(level['level_index'])}",
+                    "LV": int(level["level_index"]),
                     "目标价": float(level["target_price"]),
-                    "股数": share_text(level["planned_shares"]),
-                    "金额": float(level["planned_amount"]),
+                    "股数": float(level["planned_shares"]),
                 }
                 for level in preview_levels
             ]
         )
-        st.dataframe(
+        editor_key = (
+            f"trade_ladder_levels_editor_{idea_id}_"
+            f"{float(anchor_price):.8f}_{float(first_shares):.8f}_"
+            f"{float(trigger_pct_percent):.4f}_{int(level_count)}"
+        )
+        edited_levels = st.data_editor(
             preview_frame,
+            width="stretch",
+            hide_index=True,
+            disabled=["LV"],
+            column_config={
+                "LV": st.column_config.NumberColumn("LV", min_value=1, step=1),
+                "目标价": st.column_config.NumberColumn(
+                    "目标价",
+                    min_value=0.0,
+                    format="%.8f" if allow_fractional_shares else "%.2f",
+                ),
+                "股数": st.column_config.NumberColumn(
+                    "股数",
+                    min_value=0.00000001 if allow_fractional_shares else 1,
+                    step=0.00000001 if allow_fractional_shares else 1,
+                    format="%.8f" if allow_fractional_shares else "%d",
+                ),
+            },
+            key=editor_key,
+        )
+        edited_levels["金额"] = edited_levels["目标价"].astype(float) * edited_levels["股数"].astype(float)
+        st.dataframe(
+            edited_levels[["LV", "目标价", "股数", "金额"]],
             width="stretch",
             hide_index=True,
             column_config={
@@ -3109,18 +3155,32 @@ def trade_ladder_plan_dialog(idea_id: int) -> None:
                     "目标价",
                     format="%.8f" if allow_fractional_shares else "%.2f",
                 ),
+                "股数": st.column_config.NumberColumn(
+                    "股数",
+                    format="%.8f" if allow_fractional_shares else "%d",
+                ),
                 "金额": st.column_config.NumberColumn("金额", format="%.2f"),
             },
         )
+    else:
+        edited_levels = pd.DataFrame()
 
     if st.button("保存", type="primary", width="stretch", disabled=bool(preview_error)):
         try:
-            trade_services.create_or_replace_ladder_plan(
+            custom_levels = [
+                {
+                    "level_index": int(row["LV"]),
+                    "target_price": float(row["目标价"]),
+                    "planned_shares": float(row["股数"]),
+                }
+                for _, row in edited_levels.iterrows()
+            ]
+            trade_services.save_ladder_plan(
                 idea_id=idea_id,
                 anchor_price=float(anchor_price),
                 first_shares=float(first_shares),
                 trigger_pct=float(trigger_pct_percent) / 100,
-                level_count=int(level_count),
+                levels=custom_levels,
             )
             st.success("分档计划已保存。")
             rerun()
