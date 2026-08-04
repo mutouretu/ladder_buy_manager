@@ -2764,11 +2764,16 @@ def recommendation_detail_page() -> None:
     source_realized = source_rows["已实现盈亏"].fillna(0).sum()
     source_profit = source_floating + source_realized
     source_invested = source_rows["投入金额"].fillna(0).sum()
+    source_return_pct = (
+        source_profit / source_invested * 100
+        if source_invested > 0
+        else None
+    )
     active_observing = int((active_source_rows["状态"] == "观察中").sum())
     active_holding = int((active_source_rows["状态"] == "持仓中").sum())
     completed_count = len(completed_source_rows)
 
-    cols = st.columns([1, 1, 1, 1, 1, 1, 1])
+    cols = st.columns([1, 1, 1, 1, 1, 1, 1, 1])
     render_colored_metric(cols[0], "总标的", str(len(source_rows)), "inherit")
     render_colored_metric(cols[1], "计划中", str(active_observing), "inherit")
     render_colored_metric(cols[2], "持仓中", str(active_holding), "inherit")
@@ -2776,6 +2781,12 @@ def recommendation_detail_page() -> None:
     render_colored_metric(cols[4], "总投入", money(source_invested), "inherit")
     render_colored_metric(cols[5], "浮动盈亏", money_signed(source_floating), signed_color(source_floating))
     render_colored_metric(cols[6], "总盈亏", money_signed(source_profit), signed_color(source_profit))
+    render_colored_metric(
+        cols[7],
+        "平均收益率",
+        percent_signed(source_return_pct),
+        signed_color(source_return_pct),
+    )
 
     source = next(item for item in recommendation_sources_mock() if item["name"] == selected_source)
     st.markdown(
