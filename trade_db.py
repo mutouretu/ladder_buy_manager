@@ -28,6 +28,8 @@ def init_trade_schema() -> None:
                 symbol TEXT NOT NULL,
                 name TEXT,
                 idea_at TEXT NOT NULL,
+                idea_price REAL,
+                idea_price_at TEXT,
                 plan_price REAL,
                 current_price REAL,
                 status TEXT NOT NULL DEFAULT 'watching',
@@ -128,6 +130,8 @@ def ensure_trade_schema(conn: sqlite3.Connection) -> None:
                     symbol TEXT NOT NULL,
                     name TEXT,
                     idea_at TEXT NOT NULL,
+                    idea_price REAL,
+                    idea_price_at TEXT,
                     plan_price REAL,
                     current_price REAL,
                     status TEXT NOT NULL DEFAULT 'watching',
@@ -142,17 +146,26 @@ def ensure_trade_schema(conn: sqlite3.Connection) -> None:
             conn.execute(
                 """
                 INSERT INTO trade_ideas (
-                    id, source_id, symbol, name, idea_at, plan_price, current_price,
+                    id, source_id, symbol, name, idea_at, idea_price, idea_price_at,
+                    plan_price, current_price,
                     status, completed_at, notes, created_at, updated_at
                 )
                 SELECT
-                    id, source_id, symbol, name, idea_at, plan_price, current_price,
+                    id, source_id, symbol, name, idea_at, NULL, NULL,
+                    plan_price, current_price,
                     status, completed_at, notes, created_at, updated_at
                 FROM trade_ideas_old
                 """
             )
             conn.execute("DROP TABLE trade_ideas_old")
             conn.execute("PRAGMA foreign_keys = ON")
+    idea_column_names = {
+        row["name"] for row in conn.execute("PRAGMA table_info(trade_ideas)").fetchall()
+    }
+    if "idea_price" not in idea_column_names:
+        conn.execute("ALTER TABLE trade_ideas ADD COLUMN idea_price REAL")
+    if "idea_price_at" not in idea_column_names:
+        conn.execute("ALTER TABLE trade_ideas ADD COLUMN idea_price_at TEXT")
     ensure_trade_ladder_schema(conn)
     ensure_trade_orders_schema(conn)
 
@@ -317,6 +330,7 @@ def create_source(name: str, market: str, is_active: int = 1) -> int:
 
 
 def update_source(source_id: int, name: str, market: str, is_active: int = 1) -> None:
+    existing = get_source(source_id)
     with db.get_connection() as conn:
         conn.execute(
             """
@@ -329,6 +343,17 @@ def update_source(source_id: int, name: str, market: str, is_active: int = 1) ->
             """,
             (name.strip(), market.strip(), int(is_active), db.today_iso(), int(source_id)),
         )
+        if existing is not None and str(existing["market"]).strip() != market.strip():
+            conn.execute(
+                """
+                UPDATE trade_ideas
+                SET idea_price = NULL,
+                    idea_price_at = NULL,
+                    updated_at = ?
+                WHERE source_id = ?
+                """,
+                (db.today_iso(), int(source_id)),
+            )
 
 
 def delete_source(source_id: int) -> None:
@@ -427,6 +452,14 @@ def update_idea(
     if next_status != "completed":
         completed_at = None
     next_notes = existing["notes"] if notes is None else notes.strip()
+    cleaned_symbol = symbol.strip().upper()
+    cleaned_idea_at = idea_at.strip()
+    historical_identity_changed = (
+        cleaned_symbol != str(existing["symbol"]).strip().upper()
+        or cleaned_idea_at != str(existing["idea_at"]).strip()
+    )
+    idea_price = None if historical_identity_changed else existing["idea_price"]
+    idea_price_at = None if historical_identity_changed else existing["idea_price_at"]
     with db.get_connection() as conn:
         conn.execute(
             """
@@ -434,6 +467,8 @@ def update_idea(
             SET symbol = ?,
                 name = ?,
                 idea_at = ?,
+                idea_price = ?,
+                idea_price_at = ?,
                 plan_price = ?,
                 current_price = ?,
                 status = ?,
@@ -443,9 +478,11 @@ def update_idea(
             WHERE id = ?
             """,
             (
-                symbol.strip().upper(),
+                cleaned_symbol,
                 name.strip(),
-                idea_at.strip(),
+                cleaned_idea_at,
+                idea_price,
+                idea_price_at,
                 plan_price,
                 current_price,
                 next_status,
@@ -488,6 +525,61 @@ def update_idea_current_price(idea_id: int, current_price: float | None) -> None
         )
 
 
+def update_idea_symbol(idea_id: int, symbol: str) -> None:
+    with db.get_connection() as conn:
+        conn.execute(
+            """
+            UPDATE trade_ideas
+            SET symbol = ?,
+                updated_at = ?
+            WHERE id = ?
+              AND symbol <> ?
+            """,
+            (
+                symbol.strip().upper(),
+                db.today_iso(),
+                int(idea_id),
+                symbol.strip().upper(),
+            ),
+        )
+
+
+def update_idea_name_if_empty(idea_id: int, name: str) -> None:
+    cleaned_name = name.strip()
+    if not cleaned_name:
+        return
+    with db.get_connection() as conn:
+        conn.execute(
+            """
+            UPDATE trade_ideas
+            SET name = ?,
+                updated_at = ?
+            WHERE id = ?
+              AND (name IS NULL OR TRIM(name) = '')
+            """,
+            (cleaned_name, db.today_iso(), int(idea_id)),
+        )
+
+
+def update_idea_historical_price(
+    idea_id: int,
+    idea_price: float,
+    idea_price_at: str,
+) -> None:
+    with db.get_connection() as conn:
+        conn.execute(
+            """
+            UPDATE trade_ideas
+            SET idea_price = ?,
+                idea_price_at = ?,
+                updated_at = ?
+            WHERE id = ?
+              AND idea_price IS NULL
+            """,
+            (float(idea_price), idea_price_at.strip(), db.today_iso(), int(idea_id)),
+        )
+
+
 def update_idea_plan_price(idea_id: int, plan_price: float | None) -> None:
     with db.get_connection() as conn:
         conn.execute(
@@ -510,7 +602,8 @@ def get_idea(idea_id: int) -> sqlite3.Row | None:
     return fetch_one(
         """
         SELECT
-            id, source_id, symbol, name, idea_at, plan_price, current_price,
+            id, source_id, symbol, name, idea_at, idea_price, idea_price_at,
+            plan_price, current_price,
             status, completed_at, notes, created_at, updated_at
         FROM trade_ideas
         WHERE id = ?
@@ -524,7 +617,8 @@ def list_ideas(source_id: int | None = None) -> list[sqlite3.Row]:
         return fetch_all(
             """
             SELECT
-                id, source_id, symbol, name, idea_at, plan_price, current_price,
+                id, source_id, symbol, name, idea_at, idea_price, idea_price_at,
+                plan_price, current_price,
                 status, completed_at, notes, created_at, updated_at
             FROM trade_ideas
             ORDER BY idea_at DESC, symbol ASC
@@ -533,7 +627,8 @@ def list_ideas(source_id: int | None = None) -> list[sqlite3.Row]:
     return fetch_all(
         """
         SELECT
-            id, source_id, symbol, name, idea_at, plan_price, current_price,
+            id, source_id, symbol, name, idea_at, idea_price, idea_price_at,
+            plan_price, current_price,
             status, completed_at, notes, created_at, updated_at
         FROM trade_ideas
         WHERE source_id = ?
