@@ -18,6 +18,7 @@ import trade_services
 from models import GeneratedLevel
 
 
+market_data = importlib.reload(market_data)
 trade_db = importlib.reload(trade_db)
 trade_services = importlib.reload(trade_services)
 
@@ -527,6 +528,8 @@ TRADE_IDEA_COLUMNS = [
     "id",
     "来源",
     "提出时间",
+    "提出价",
+    "提出行情时间",
     "标的",
     "名称",
     "计划价",
@@ -596,6 +599,8 @@ def recommendations_mock() -> list[dict]:
             "symbol": idea["symbol"],
             "name": idea["name"] or "",
             "recommended_at": idea["idea_at"],
+            "idea_price": idea["idea_price"],
+            "idea_price_at": idea["idea_price_at"],
             "recommendation_price": idea["plan_price"],
             "current_price": idea["current_price"],
             "manual_status": idea["status"],
@@ -614,6 +619,8 @@ def get_recommendation_plan(recommendation_id: int) -> dict | None:
         "symbol": idea["symbol"],
         "name": idea["name"] or "",
         "recommended_at": idea["idea_at"],
+        "idea_price": idea["idea_price"],
+        "idea_price_at": idea["idea_price_at"],
         "recommendation_price": idea["plan_price"],
         "current_price": idea["current_price"],
         "manual_status": idea["status"],
@@ -922,8 +929,20 @@ def handle_recommendation_plan_action() -> None:
     clear_query_params()
     if action == "refresh":
         try:
-            quote = refresh_trade_idea_price(recommendation_id)
-            st.toast(f"{quote.symbol} 已更新：{price(quote.price)}")
+            quote, historical_quote, historical_error = refresh_trade_idea_with_snapshot(
+                recommendation_id
+            )
+            if historical_error:
+                st.toast(
+                    f"{quote.symbol} 当前价已更新，提出价获取失败：{historical_error}"
+                )
+            elif historical_quote is not None:
+                st.toast(
+                    f"{quote.symbol} 当前价 {price(quote.price)}，"
+                    f"提出价 {price(historical_quote.price)}"
+                )
+            else:
+                st.toast(f"{quote.symbol} 已更新：{price(quote.price)}")
             rerun()
         except Exception as exc:
             st.error(f"价格更新失败：{exc}")
@@ -1234,6 +1253,20 @@ def recommendation_time_cell(value: object) -> str:
     return html.escape(text)
 
 
+def historical_price_cell(value: object, current_price: object, quote_at: object) -> str:
+    if value is None or pd.isna(value):
+        return "-"
+    numeric_value = float(value)
+    value_text = price(numeric_value)
+    quote_time = "" if quote_at is None or pd.isna(quote_at) else str(quote_at).strip()
+    title = f" title='行情时间：{html.escape(quote_time)}'" if quote_time else ""
+    style = ""
+    if current_price is not None and not pd.isna(current_price):
+        color = "#22c55e" if numeric_value <= float(current_price) else "#f87171"
+        style = f" style='color: {color}; font-weight: 700;'"
+    return f"<span{title}{style}>{html.escape(value_text)}</span>"
+
+
 def datetime_display_text(value: object) -> str:
     text = "" if value is None or pd.isna(value) else str(value).strip()
     if not text:
@@ -1241,6 +1274,63 @@ def datetime_display_text(value: object) -> str:
     if len(text) == 10 and text[4] == "-" and text[7] == "-":
         return f"{text} 00:00"
     return text
+
+
+def persist_normalized_china_symbol(
+    idea_id: int,
+    original_symbol: str,
+    normalized_symbol: str,
+    market: str | None,
+) -> None:
+    if (market or "").strip() != "A股":
+        return
+    if original_symbol.strip().upper() == normalized_symbol.strip().upper():
+        return
+    trade_db.update_idea_symbol(idea_id, normalized_symbol)
+
+
+def persist_missing_idea_name(
+    idea_id: int,
+    current_name: str | None,
+    symbol: str,
+    market: str | None,
+    fallback: str | None = None,
+) -> str | None:
+    if str(current_name or "").strip():
+        return None
+    resolved_name = market_data.fetch_instrument_name(
+        symbol,
+        market=market,
+        fallback=fallback,
+    )
+    if resolved_name:
+        trade_db.update_idea_name_if_empty(idea_id, resolved_name)
+    return resolved_name
+
+
+def ensure_trade_idea_name(idea_id: int) -> str | None:
+    idea = trade_services.get_idea(idea_id)
+    if idea is None:
+        raise ValueError("标的不存在。")
+    if str(idea["name"] or "").strip():
+        return None
+    source = get_recommendation_source(int(idea["source_id"]))
+    market = source["market"] if source is not None else None
+    normalized_symbol = market_data.normalize_symbol(idea["symbol"], market=market)
+    resolved_name = persist_missing_idea_name(
+        idea_id,
+        idea["name"],
+        normalized_symbol,
+        market,
+    )
+    if resolved_name:
+        persist_normalized_china_symbol(
+            idea_id,
+            idea["symbol"],
+            normalized_symbol,
+            market,
+        )
+    return resolved_name
 
 
 def refresh_trade_idea_price(idea_id: int) -> market_data.Quote:
@@ -1251,7 +1341,99 @@ def refresh_trade_idea_price(idea_id: int) -> market_data.Quote:
     market = source["market"] if source is not None else None
     quote = market_data.fetch_latest_price(idea["symbol"], market=market)
     trade_db.update_idea_current_price(idea_id, quote.price)
+    persist_normalized_china_symbol(
+        idea_id,
+        idea["symbol"],
+        quote.symbol,
+        market,
+    )
+    persist_missing_idea_name(
+        idea_id,
+        idea["name"],
+        quote.symbol,
+        market,
+        fallback=quote.name,
+    )
     return quote
+
+
+def ensure_trade_idea_historical_price(
+    idea_id: int,
+) -> market_data.HistoricalQuote | None:
+    idea = trade_services.get_idea(idea_id)
+    if idea is None:
+        raise ValueError("标的不存在。")
+    if idea["idea_price"] is not None:
+        return None
+    source = get_recommendation_source(int(idea["source_id"]))
+    market = source["market"] if source is not None else None
+    quote = market_data.fetch_historical_price(
+        idea["symbol"],
+        idea["idea_at"],
+        market=market,
+    )
+    trade_db.update_idea_historical_price(idea_id, quote.price, quote.quote_at)
+    persist_normalized_china_symbol(
+        idea_id,
+        idea["symbol"],
+        quote.symbol,
+        market,
+    )
+    persist_missing_idea_name(
+        idea_id,
+        idea["name"],
+        quote.symbol,
+        market,
+        fallback=quote.name,
+    )
+    return quote
+
+
+def refresh_trade_idea_with_snapshot(
+    idea_id: int,
+) -> tuple[market_data.Quote, market_data.HistoricalQuote | None, str | None]:
+    current_quote = refresh_trade_idea_price(idea_id)
+    try:
+        historical_quote = ensure_trade_idea_historical_price(idea_id)
+        return current_quote, historical_quote, None
+    except Exception as exc:
+        return current_quote, None, str(exc)
+
+
+def refresh_trade_price_rows(rows: pd.DataFrame) -> tuple[int, list[str]]:
+    success_count = 0
+    failures: list[str] = []
+    for _, row in rows.iterrows():
+        row_updated = False
+        metadata_refreshed = False
+        if row["状态"] in {"观察中", "持仓中"}:
+            try:
+                refresh_trade_idea_price(int(row["id"]))
+                row_updated = True
+                metadata_refreshed = True
+            except Exception as exc:
+                failures.append(f"{row['标的']} 当前价: {exc}")
+        if row["提出价"] is None or pd.isna(row["提出价"]):
+            try:
+                historical_quote = ensure_trade_idea_historical_price(int(row["id"]))
+                row_updated = row_updated or historical_quote is not None
+                metadata_refreshed = metadata_refreshed or historical_quote is not None
+            except Exception as exc:
+                failures.append(f"{row['标的']} 提出价: {exc}")
+        name_missing = (
+            row["名称"] is None
+            or pd.isna(row["名称"])
+            or not str(row["名称"]).strip()
+        )
+        if name_missing and not metadata_refreshed:
+            try:
+                resolved_name = ensure_trade_idea_name(int(row["id"]))
+                row_updated = row_updated or resolved_name is not None
+            except Exception as exc:
+                failures.append(f"{row['标的']} 名称: {exc}")
+        if row_updated:
+            success_count += 1
+    return success_count, failures
 
 
 def refresh_trade_source_prices(source_id: int) -> tuple[int, list[str]]:
@@ -1259,37 +1441,28 @@ def refresh_trade_source_prices(source_id: int) -> tuple[int, list[str]]:
     source = get_recommendation_source(source_id)
     if source is None:
         raise ValueError("项目不存在。")
-    source_rows = rows[
-        (rows["来源"] == source["name"]) & rows["状态"].isin(["观察中", "持仓中"])
-    ].copy()
-    success_count = 0
-    failures: list[str] = []
-    for _, row in source_rows.iterrows():
-        try:
-            refresh_trade_idea_price(int(row["id"]))
-            success_count += 1
-        except Exception as exc:
-            failures.append(f"{row['标的']}: {exc}")
-    return success_count, failures
+    source_rows = rows[rows["来源"] == source["name"]].copy()
+    return refresh_trade_price_rows(source_rows)
 
 
 def refresh_all_trade_prices() -> tuple[int, list[str]]:
     rows = ensure_trade_idea_columns(recommendation_rows())
-    active_rows = rows[rows["状态"].isin(["观察中", "持仓中"])].copy()
-    success_count = 0
-    failures: list[str] = []
-    for _, row in active_rows.iterrows():
-        try:
-            refresh_trade_idea_price(int(row["id"]))
-            success_count += 1
-        except Exception as exc:
-            failures.append(f"{row['标的']}: {exc}")
-    return success_count, failures
+    return refresh_trade_price_rows(rows)
 
 
 def render_recommendation_detail_table(frame: pd.DataFrame, source_id: int | None = None) -> None:
-    labels = ["标的/名称", "提出时间", "计划价/当前价", "买入价/卖出价", "持仓/卖出", "浮盈/实盈", "投入/收益率", "操作"]
-    widths = [17, 16, 12, 12, 8, 13, 11, 11]
+    labels = [
+        "标的/名称",
+        "提出时间",
+        "提出价",
+        "计划价/当前价",
+        "买入价/卖出价",
+        "持仓/卖出",
+        "浮盈/实盈",
+        "投入/收益率",
+        "操作",
+    ]
+    widths = [15, 14, 8, 11, 11, 8, 12, 11, 10]
     header_cells = []
     for label in labels:
         if label == "操作" and source_id is not None:
@@ -1328,6 +1501,14 @@ def render_recommendation_detail_table(frame: pd.DataFrame, source_id: int | Non
                 True,
             ),
             (recommendation_time_cell(row["提出时间"]), False),
+            (
+                historical_price_cell(
+                    row["提出价"],
+                    row["当前价"],
+                    row["提出行情时间"],
+                ),
+                True,
+            ),
             (recommendation_plan_current_pair(row["计划价"], row["当前价"]), True),
             (recommendation_price_pair(row["买入价"], row["卖出价"]), False),
             (f"{share_text(row['持仓股数'])}/{share_text(row['卖出股数'])}股", False),
@@ -1429,8 +1610,18 @@ def render_recommendation_detail_table(frame: pd.DataFrame, source_id: int | Non
 
 
 def render_trade_history_table(frame: pd.DataFrame, return_page: str = "项目详情") -> None:
-    labels = ["标的/名称", "提出时间", "计划价/当前价", "买入价/卖出价", "实盈", "收益率", "状态", "操作"]
-    widths = [20, 17, 13, 13, 10, 9, 9, 9]
+    labels = [
+        "标的/名称",
+        "提出时间",
+        "提出价",
+        "计划价/当前价",
+        "买入价/卖出价",
+        "实盈",
+        "收益率",
+        "状态",
+        "操作",
+    ]
+    widths = [18, 15, 8, 12, 12, 10, 8, 8, 9]
     header = "".join(f"<th>{html.escape(label)}</th>" for label in labels)
     colgroup = "".join(f"<col style='width: {width}%'>" for width in widths)
     rows = []
@@ -1450,6 +1641,14 @@ def render_trade_history_table(frame: pd.DataFrame, return_page: str = "项目�
         cells = [
             (f"{row['标的']}/{row['名称']}", False),
             (recommendation_time_cell(row["提出时间"]), False),
+            (
+                historical_price_cell(
+                    row["提出价"],
+                    row["当前价"],
+                    row["提出行情时间"],
+                ),
+                True,
+            ),
             (recommendation_price_pair(row["计划价"], row["当前价"]), False),
             (recommendation_price_pair(row["买入价"], row["卖出价"]), False),
             (colored_money_text(row["已实现盈亏"]), True),
@@ -3588,8 +3787,20 @@ def stock_operation_page() -> None:
     action_cols = st.columns([0.45, 0.55, 0.55, 5])
     if action_cols[0].button("↻", help="刷新价格", width="stretch"):
         try:
-            quote = refresh_trade_idea_price(int(row["id"]))
-            st.toast(f"{quote.symbol} 已更新：{price(quote.price)}")
+            quote, historical_quote, historical_error = refresh_trade_idea_with_snapshot(
+                int(row["id"])
+            )
+            if historical_error:
+                st.toast(
+                    f"{quote.symbol} 当前价已更新，提出价获取失败：{historical_error}"
+                )
+            elif historical_quote is not None:
+                st.toast(
+                    f"{quote.symbol} 当前价 {price(quote.price)}，"
+                    f"提出价 {price(historical_quote.price)}"
+                )
+            else:
+                st.toast(f"{quote.symbol} 已更新：{price(quote.price)}")
             rerun()
         except Exception as exc:
             st.error(f"价格更新失败：{exc}")
