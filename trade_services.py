@@ -7,7 +7,9 @@ from math import floor, isfinite
 import pandas as pd
 
 import db
+import market_data
 import trade_db
+import trade_import
 
 
 STATUS_LABELS = {
@@ -259,6 +261,48 @@ def delete_order(order_id: int) -> None:
     trade_db.delete_order(order_id)
     refresh_idea_status_from_orders(idea_id)
     sync_next_ladder_plan_price(idea_id)
+
+
+def parse_tonghuashun_delivery(content: bytes) -> list[trade_import.TonghuashunDeliveryRecord]:
+    return trade_import.parse_tonghuashun_delivery(content)
+
+
+def import_tonghuashun_delivery(
+    source_id: int,
+    records: list[trade_import.TonghuashunDeliveryRecord],
+) -> dict[str, object]:
+    source = trade_db.get_source(source_id)
+    if source is None:
+        raise ValueError("项目不存在。")
+    market = str(source["market"] or "").strip()
+    if market != "A股":
+        raise ValueError("同花顺 A 股交割单只能导入到 A 股项目。")
+    if not records:
+        raise ValueError("交割单中没有可导入的成交记录。")
+
+    prepared_records = []
+    for record in records:
+        normalized_symbol = market_data.normalize_symbol(record.symbol, market=market)
+        if abs(record.shares - round(record.shares)) > 0.00000001:
+            raise ValueError(f"{record.symbol} 的 A 股成交股数必须是整数。")
+        prepared_records.append(
+            {
+                "symbol": normalized_symbol,
+                "raw_symbol": record.symbol,
+                "name": record.name,
+                "side": record.side,
+                "trade_at": record.trade_at,
+                "price": record.price,
+                "shares": record.shares,
+                "fees": record.fees,
+                "external_order_id": record.external_order_id,
+            }
+        )
+    return trade_db.import_external_orders(
+        source_id=source_id,
+        records=prepared_records,
+        external_source=trade_import.TONGHUASHUN_EXTERNAL_SOURCE,
+    )
 
 
 def generate_ladder_levels(
@@ -606,7 +650,7 @@ def idea_rows() -> pd.DataFrame:
         )
         average_cost = buy_amount / buy_shares if buy_shares else None
         average_sell_price = sell_amount / sell_shares if sell_shares else None
-        position_shares = buy_shares - sell_shares
+        position_shares = max(0.0, buy_shares - sell_shares)
         remaining_cost = (average_cost or 0) * position_shares
         realized_profit = (
             sell_amount - (average_cost or 0) * sell_shares

@@ -52,6 +52,8 @@ def init_trade_schema() -> None:
                 price REAL NOT NULL,
                 shares REAL NOT NULL,
                 fees REAL NOT NULL DEFAULT 0,
+                external_source TEXT,
+                external_order_id TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 FOREIGN KEY (idea_id) REFERENCES trade_ideas(id) ON DELETE CASCADE,
@@ -104,6 +106,8 @@ def create_trade_orders_table(conn: sqlite3.Connection) -> None:
             price REAL NOT NULL,
             shares REAL NOT NULL,
             fees REAL NOT NULL DEFAULT 0,
+            external_source TEXT,
+            external_order_id TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             FOREIGN KEY (idea_id) REFERENCES trade_ideas(id) ON DELETE CASCADE,
@@ -218,6 +222,12 @@ def ensure_trade_orders_schema(conn: sqlite3.Connection) -> None:
     if not order_columns:
         return
     order_column_names = {row["name"] for row in order_columns}
+    if "external_source" not in order_column_names:
+        conn.execute("ALTER TABLE trade_orders ADD COLUMN external_source TEXT")
+    if "external_order_id" not in order_column_names:
+        conn.execute("ALTER TABLE trade_orders ADD COLUMN external_order_id TEXT")
+    order_columns = conn.execute("PRAGMA table_info(trade_orders)").fetchall()
+    order_column_names = {row["name"] for row in order_columns}
     foreign_keys = conn.execute("PRAGMA foreign_key_list(trade_orders)").fetchall()
     idea_foreign_keys = [row for row in foreign_keys if row["from"] == "idea_id"]
     level_foreign_keys = [row for row in foreign_keys if row["from"] == "ladder_level_id"]
@@ -229,6 +239,7 @@ def ensure_trade_orders_schema(conn: sqlite3.Connection) -> None:
         and level_foreign_keys
         and all(row["table"] == "trade_ladder_levels" for row in level_foreign_keys)
     ):
+        create_trade_order_external_index(conn)
         return
 
     conn.execute("PRAGMA foreign_keys = OFF")
@@ -240,11 +251,11 @@ def ensure_trade_orders_schema(conn: sqlite3.Connection) -> None:
             """
             INSERT INTO trade_orders (
                 id, idea_id, ladder_level_id, side, trade_at, price, shares, fees,
-                created_at, updated_at
+                external_source, external_order_id, created_at, updated_at
             )
             SELECT
                 id, idea_id, ladder_level_id, side, trade_at, price, shares, fees,
-                created_at, updated_at
+                external_source, external_order_id, created_at, updated_at
             FROM trade_orders_rebuild_old
             """
         )
@@ -253,16 +264,27 @@ def ensure_trade_orders_schema(conn: sqlite3.Connection) -> None:
             """
             INSERT INTO trade_orders (
                 id, idea_id, ladder_level_id, side, trade_at, price, shares, fees,
-                created_at, updated_at
+                external_source, external_order_id, created_at, updated_at
             )
             SELECT
                 id, idea_id, NULL, side, trade_at, price, shares, fees,
-                created_at, updated_at
+                external_source, external_order_id, created_at, updated_at
             FROM trade_orders_rebuild_old
             """
         )
     conn.execute("DROP TABLE trade_orders_rebuild_old")
     conn.execute("PRAGMA foreign_keys = ON")
+    create_trade_order_external_index(conn)
+
+
+def create_trade_order_external_index(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_trade_orders_external
+        ON trade_orders (external_source, external_order_id)
+        WHERE external_source IS NOT NULL AND external_order_id IS NOT NULL
+        """
+    )
 
 
 def ensure_trade_ladder_schema(conn: sqlite3.Connection) -> None:
@@ -646,15 +668,18 @@ def create_order(
     shares: float,
     fees: float = 0.0,
     ladder_level_id: int | None = None,
+    external_source: str | None = None,
+    external_order_id: str | None = None,
 ) -> int:
     now = db.today_iso()
     with db.get_connection() as conn:
         cursor = conn.execute(
             """
             INSERT INTO trade_orders (
-                idea_id, ladder_level_id, side, trade_at, price, shares, fees, created_at, updated_at
+                idea_id, ladder_level_id, side, trade_at, price, shares, fees,
+                external_source, external_order_id, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 int(idea_id),
@@ -664,6 +689,8 @@ def create_order(
                 float(price),
                 float(shares),
                 float(fees),
+                external_source.strip() if external_source else None,
+                external_order_id.strip() if external_order_id else None,
                 now,
                 now,
             ),
@@ -716,7 +743,7 @@ def get_order(order_id: int) -> sqlite3.Row | None:
         """
         SELECT
             id, idea_id, ladder_level_id, side, trade_at, price, shares, fees,
-            created_at, updated_at
+            external_source, external_order_id, created_at, updated_at
         FROM trade_orders
         WHERE id = ?
         """,
@@ -730,7 +757,7 @@ def list_orders(idea_id: int | None = None) -> list[sqlite3.Row]:
             """
             SELECT
                 id, idea_id, ladder_level_id, side, trade_at, price, shares, fees,
-                created_at, updated_at
+                external_source, external_order_id, created_at, updated_at
             FROM trade_orders
             ORDER BY trade_at ASC, id ASC
             """
@@ -739,13 +766,298 @@ def list_orders(idea_id: int | None = None) -> list[sqlite3.Row]:
         """
         SELECT
             id, idea_id, ladder_level_id, side, trade_at, price, shares, fees,
-            created_at, updated_at
+            external_source, external_order_id, created_at, updated_at
         FROM trade_orders
         WHERE idea_id = ?
         ORDER BY trade_at ASC, id ASC
         """,
         (int(idea_id),),
     )
+
+
+def import_external_orders(
+    source_id: int,
+    records: list[dict[str, Any]],
+    external_source: str,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "created_ideas": 0,
+        "created_plans": 0,
+        "imported_orders": 0,
+        "skipped_orders": 0,
+        "incomplete_symbols": [],
+        "plan_conflicts": [],
+    }
+    if not records:
+        return result
+
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for record in records:
+        grouped.setdefault(str(record["symbol"]), []).append(record)
+
+    now = db.today_iso()
+    with db.get_connection() as conn:
+        source = conn.execute(
+            "SELECT id FROM trade_sources WHERE id = ?",
+            (int(source_id),),
+        ).fetchone()
+        if source is None:
+            raise ValueError("项目不存在。")
+
+        existing_external_ids = {
+            str(row["external_order_id"])
+            for row in conn.execute(
+                """
+                SELECT external_order_id
+                FROM trade_orders
+                WHERE external_source = ?
+                  AND external_order_id IS NOT NULL
+                """,
+                (external_source,),
+            ).fetchall()
+        }
+
+        for symbol, symbol_records in grouped.items():
+            pending_records = [
+                record
+                for record in symbol_records
+                if str(record["external_order_id"]) not in existing_external_ids
+            ]
+            result["skipped_orders"] += len(symbol_records) - len(pending_records)
+            if not pending_records:
+                continue
+
+            raw_symbol = str(pending_records[0].get("raw_symbol") or symbol)
+            idea = conn.execute(
+                """
+                SELECT DISTINCT i.*
+                FROM trade_ideas i
+                JOIN trade_orders o ON o.idea_id = i.id
+                WHERE i.source_id = ?
+                  AND i.symbol IN (?, ?)
+                  AND o.external_source = ?
+                ORDER BY i.id DESC
+                LIMIT 1
+                """,
+                (int(source_id), symbol, raw_symbol, external_source),
+            ).fetchone()
+            imported_idea = idea is not None
+            if idea is None:
+                idea = conn.execute(
+                    """
+                    SELECT *
+                    FROM trade_ideas
+                    WHERE source_id = ?
+                      AND symbol IN (?, ?)
+                      AND status <> 'completed'
+                    ORDER BY id DESC
+                    LIMIT 1
+                    """,
+                    (int(source_id), symbol, raw_symbol),
+                ).fetchone()
+
+            earliest_trade_at = min(str(record["trade_at"]) for record in pending_records)
+            name = next(
+                (str(record.get("name") or "").strip() for record in pending_records if record.get("name")),
+                "",
+            )
+            if idea is None:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO trade_ideas (
+                        source_id, symbol, name, idea_at, plan_price, current_price,
+                        status, completed_at, notes, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, NULL, NULL, 'watching', NULL, '', ?, ?)
+                    """,
+                    (int(source_id), symbol, name, earliest_trade_at, now, now),
+                )
+                idea_id = int(cursor.lastrowid)
+                result["created_ideas"] += 1
+            else:
+                idea_id = int(idea["id"])
+                if imported_idea and earliest_trade_at < str(idea["idea_at"]):
+                    conn.execute(
+                        """
+                        UPDATE trade_ideas
+                        SET idea_at = ?, idea_price = NULL, idea_price_at = NULL, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (earliest_trade_at, now, idea_id),
+                    )
+                if name:
+                    conn.execute(
+                        """
+                        UPDATE trade_ideas
+                        SET name = CASE WHEN name IS NULL OR TRIM(name) = '' THEN ? ELSE name END,
+                            symbol = ?,
+                            updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (name, symbol, now, idea_id),
+                    )
+
+            plan = conn.execute(
+                "SELECT * FROM trade_ladder_plans WHERE idea_id = ?",
+                (idea_id,),
+            ).fetchone()
+            level_id: int | None = None
+            manage_imported_plan = False
+            if plan is None and any(record["side"] == "BUY" for record in pending_records):
+                buy_records = [record for record in pending_records if record["side"] == "BUY"]
+                buy_shares = sum(float(record["shares"]) for record in buy_records)
+                buy_amount = sum(float(record["price"]) * float(record["shares"]) for record in buy_records)
+                anchor_price = buy_amount / buy_shares
+                plan_cursor = conn.execute(
+                    """
+                    INSERT INTO trade_ladder_plans (
+                        idea_id, anchor_price, first_shares, trigger_pct, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, 0, ?, ?)
+                    """,
+                    (idea_id, anchor_price, buy_shares, now, now),
+                )
+                plan_id = int(plan_cursor.lastrowid)
+                level_cursor = conn.execute(
+                    """
+                    INSERT INTO trade_ladder_levels (
+                        plan_id, level_index, target_price, planned_shares,
+                        planned_amount, created_at, updated_at
+                    )
+                    VALUES (?, 1, ?, ?, ?, ?, ?)
+                    """,
+                    (plan_id, anchor_price, buy_shares, round(buy_amount, 2), now, now),
+                )
+                level_id = int(level_cursor.lastrowid)
+                manage_imported_plan = True
+                result["created_plans"] += 1
+            elif plan is not None:
+                levels = conn.execute(
+                    """
+                    SELECT id
+                    FROM trade_ladder_levels
+                    WHERE plan_id = ?
+                    ORDER BY level_index ASC
+                    """,
+                    (int(plan["id"]),),
+                ).fetchall()
+                if len(levels) == 1:
+                    level_id = int(levels[0]["id"])
+                    manage_imported_plan = imported_idea and float(plan["trigger_pct"]) == 0
+                elif any(record["side"] == "BUY" for record in pending_records):
+                    result["plan_conflicts"].append(symbol)
+
+            if level_id is not None:
+                conn.execute(
+                    """
+                    UPDATE trade_orders
+                    SET ladder_level_id = ?, updated_at = ?
+                    WHERE idea_id = ?
+                      AND external_source = ?
+                      AND ladder_level_id IS NULL
+                    """,
+                    (level_id, now, idea_id, external_source),
+                )
+
+            for record in pending_records:
+                try:
+                    conn.execute(
+                        """
+                        INSERT INTO trade_orders (
+                            idea_id, ladder_level_id, side, trade_at, price, shares, fees,
+                            external_source, external_order_id, created_at, updated_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            idea_id,
+                            level_id,
+                            str(record["side"]),
+                            str(record["trade_at"]),
+                            float(record["price"]),
+                            float(record["shares"]),
+                            float(record["fees"]),
+                            external_source,
+                            str(record["external_order_id"]),
+                            now,
+                            now,
+                        ),
+                    )
+                except sqlite3.IntegrityError as exc:
+                    if "trade_orders.external_source, trade_orders.external_order_id" not in str(exc):
+                        raise
+                    result["skipped_orders"] += 1
+                    continue
+                existing_external_ids.add(str(record["external_order_id"]))
+                result["imported_orders"] += 1
+
+            if level_id is not None and manage_imported_plan:
+                executed_buys = conn.execute(
+                    """
+                    SELECT COALESCE(SUM(price * shares), 0) AS amount,
+                           COALESCE(SUM(shares), 0) AS shares
+                    FROM trade_orders
+                    WHERE ladder_level_id = ? AND side = 'BUY'
+                    """,
+                    (level_id,),
+                ).fetchone()
+                executed_shares = float(executed_buys["shares"])
+                if executed_shares > 0:
+                    executed_amount = float(executed_buys["amount"])
+                    average_price = executed_amount / executed_shares
+                    level = conn.execute(
+                        "SELECT plan_id FROM trade_ladder_levels WHERE id = ?",
+                        (level_id,),
+                    ).fetchone()
+                    conn.execute(
+                        """
+                        UPDATE trade_ladder_levels
+                        SET target_price = ?, planned_shares = ?, planned_amount = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (average_price, executed_shares, round(executed_amount, 2), now, level_id),
+                    )
+                    conn.execute(
+                        """
+                        UPDATE trade_ladder_plans
+                        SET anchor_price = ?, first_shares = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (average_price, executed_shares, now, int(level["plan_id"])),
+                    )
+
+            totals = conn.execute(
+                """
+                SELECT
+                    COALESCE(SUM(CASE WHEN side = 'BUY' THEN shares ELSE 0 END), 0) AS bought,
+                    COALESCE(SUM(CASE WHEN side = 'SELL' THEN shares ELSE 0 END), 0) AS sold
+                FROM trade_orders
+                WHERE idea_id = ?
+                """,
+                (idea_id,),
+            ).fetchone()
+            bought_shares = float(totals["bought"])
+            sold_shares = float(totals["sold"])
+            next_status = "holding" if bought_shares > 0 else "watching"
+            conn.execute(
+                """
+                UPDATE trade_ideas
+                SET status = ?, completed_at = NULL, updated_at = ?
+                WHERE id = ?
+                """,
+                (next_status, now, idea_id),
+            )
+            if level_id is not None:
+                conn.execute(
+                    "UPDATE trade_ideas SET plan_price = NULL, updated_at = ? WHERE id = ?",
+                    (now, idea_id),
+                )
+            if sold_shares - bought_shares > 0.00000001:
+                result["incomplete_symbols"].append(symbol)
+
+    result["incomplete_symbols"] = sorted(set(result["incomplete_symbols"]))
+    result["plan_conflicts"] = sorted(set(result["plan_conflicts"]))
+    return result
 
 
 def get_ladder_plan_by_idea(idea_id: int) -> sqlite3.Row | None:
