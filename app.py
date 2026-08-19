@@ -14,12 +14,14 @@ import db
 import market_data
 import services
 import trade_db
+import trade_import
 import trade_services
 from models import GeneratedLevel
 
 
 market_data = importlib.reload(market_data)
 trade_db = importlib.reload(trade_db)
+trade_import = importlib.reload(trade_import)
 trade_services = importlib.reload(trade_services)
 
 
@@ -788,6 +790,89 @@ def handle_recommendation_source_action() -> None:
             st.session_state["page"] = return_page
         except Exception as exc:
             st.error(f"全部更新失败：{exc}")
+
+
+@st.dialog("导入同花顺交割单")
+def import_tonghuashun_delivery_dialog(source_id: int) -> None:
+    source = get_recommendation_source(source_id)
+    if source is None:
+        st.warning("项目不存在，可能已经被删除。")
+        return
+    st.caption(f"导入项目：{source['name']} / {source['market']}")
+    if str(source["market"]).strip() != "A股":
+        st.error("同花顺 A 股交割单只能导入到 A 股项目。")
+        return
+    uploaded_file = st.file_uploader(
+        "选择交割单",
+        type=["xls", "txt", "csv"],
+        key=f"tonghuashun_delivery_file_{source_id}",
+    )
+    if uploaded_file is None:
+        return
+
+    try:
+        records = trade_services.parse_tonghuashun_delivery(uploaded_file.getvalue())
+    except ValueError as exc:
+        st.error(str(exc))
+        return
+
+    preview = pd.DataFrame([record.preview_row() for record in records])
+    buy_count = sum(record.side == "BUY" for record in records)
+    sell_count = len(records) - buy_count
+    symbol_count = len({record.symbol for record in records})
+    st.caption(
+        f"共 {len(records)} 笔 / {symbol_count} 只标的 / "
+        f"买入 {buy_count} 笔 / 卖出 {sell_count} 笔"
+    )
+    st.dataframe(
+        preview,
+        hide_index=True,
+        height=min(420, 38 + 35 * len(preview)),
+        column_config={
+            "成交价": st.column_config.NumberColumn(format="%.3f"),
+            "股数": st.column_config.NumberColumn(format="%.0f"),
+            "费用": st.column_config.NumberColumn(format="%.2f"),
+        },
+    )
+
+    balances: dict[str, float] = {}
+    names: dict[str, str] = {}
+    for record in records:
+        balances.setdefault(record.symbol, 0.0)
+        balances[record.symbol] += record.shares if record.side == "BUY" else -record.shares
+        names[record.symbol] = record.name
+    incomplete = [
+        f"{symbol}/{names[symbol]}"
+        for symbol, balance in balances.items()
+        if balance < -0.00000001
+    ]
+    if incomplete:
+        st.warning(
+            "以下标的在本文件中只有卖出或卖出数量更多，"
+            "需要补导更早的买入记录才能准确计算盈亏："
+            + "、".join(incomplete)
+        )
+
+    if st.button("确认导入", type="primary", width="stretch"):
+        try:
+            result = trade_services.import_tonghuashun_delivery(source_id, records)
+        except (ValueError, sqlite3.Error) as exc:
+            st.error(f"导入失败：{exc}")
+            return
+        st.session_state["trade_delivery_import_notice"] = (
+            f"已导入 {result['imported_orders']} 笔交易，"
+            f"新建 {result['created_ideas']} 只标的和 "
+            f"{result['created_plans']} 个单档计划；"
+            f"跳过 {result['skipped_orders']} 笔重复记录。"
+        )
+        warnings = []
+        if result["incomplete_symbols"]:
+            warnings.append("买入记录不完整：" + "、".join(result["incomplete_symbols"]))
+        if result["plan_conflicts"]:
+            warnings.append("已有多档计划，未自动关联 LV：" + "、".join(result["plan_conflicts"]))
+        if warnings:
+            st.session_state["trade_delivery_import_warning"] = "；".join(warnings)
+        rerun()
 
 
 @st.dialog("新增标的")
@@ -2946,6 +3031,12 @@ def recommendation_overview_page() -> None:
 def recommendation_detail_page() -> None:
     handle_recommendation_source_action()
     handle_recommendation_plan_action()
+    import_notice = st.session_state.pop("trade_delivery_import_notice", None)
+    import_warning = st.session_state.pop("trade_delivery_import_warning", None)
+    if import_notice:
+        st.success(import_notice)
+    if import_warning:
+        st.warning(import_warning)
     rows = ensure_trade_idea_columns(recommendation_rows())
     summary = recommendation_source_summary()
     if summary.empty:
@@ -3003,9 +3094,11 @@ def recommendation_detail_page() -> None:
     else:
         render_recommendation_detail_table(active_source_rows, source_id=int(source["id"]))
 
-    left, _ = st.columns([0.35, 6])
+    left, import_col, _ = st.columns([0.35, 0.35, 5.65])
     if left.button("＋", width="stretch", help="新增标的"):
         create_recommendation_plan_dialog(int(source["id"]))
+    if import_col.button("⇧", width="stretch", help="导入同花顺交割单"):
+        import_tonghuashun_delivery_dialog(int(source["id"]))
 
     st.markdown("**交易历史**")
     if completed_source_rows.empty:
